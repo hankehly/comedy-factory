@@ -41,7 +41,11 @@ class Grade(BaseModel):
 
 # Scanning news is a genuine agent step (search tool loop); the subtext steps
 # are single model calls made directly via model_request_sync.
-_scan_news_agent = Agent(settings.model, capabilities=[WebSearch()])
+_scan_news_agent = Agent(
+    settings.model,
+    name="scan_news",
+    capabilities=[WebSearch()],
+)
 
 _grade_request_parameters = ModelRequestParameters(
     output_mode="native",
@@ -88,7 +92,8 @@ def generate_subtext(
         )
 
     response = model_request_sync(
-        settings.model, [ModelRequest.user_text_prompt(prompt)]
+        settings.model,
+        [ModelRequest.user_text_prompt(prompt)],
     )
 
     # The prompt forbids surrounding quotes, but strip them if they slip through.

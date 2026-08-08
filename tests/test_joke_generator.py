@@ -41,7 +41,20 @@ def test_scan_news_parses_topics():
 
 def test_generate_subtext_strips_quotes(monkeypatch):
     monkeypatch.setattr(settings, "model", canned_model('"A fake subtext."'))
-    assert generate_subtext("A fake topic.") == "A fake subtext."
+    subtext, history = generate_subtext("A fake topic.")
+    assert subtext == "A fake subtext."
+    assert len(history) == 2  # templated prompt + model response
+
+
+def test_generate_subtext_retry_extends_history(monkeypatch):
+    monkeypatch.setattr(settings, "model", canned_model("A better subtext."))
+    _, history = generate_subtext("A fake topic.")
+    subtext, history = generate_subtext(
+        "A fake topic.", history=history, feedback="* Too wordy."
+    )
+    assert subtext == "A better subtext."
+    assert len(history) == 4  # prompt, first attempt, feedback, rewrite
+    assert "Too wordy" in history[2].parts[0].content
 
 
 def test_grade_subtext_pass(monkeypatch):

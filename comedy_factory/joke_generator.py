@@ -17,7 +17,7 @@ from pydantic import BaseModel, Field
 from pydantic_ai import Agent
 from pydantic_ai.capabilities import WebSearch
 from pydantic_ai.direct import model_request_sync
-from pydantic_ai.messages import ModelRequest
+from pydantic_ai.messages import ModelMessage, ModelRequest
 from pydantic_ai.models import ModelRequestParameters
 from pydantic_ai.output import OutputObjectDefinition
 
@@ -73,31 +73,34 @@ def scan_news(num_topics: int = 1) -> list[str]:
 
 def generate_subtext(
     topic: str,
-    previous_subtext: str | None = None,
+    history: list[ModelMessage] | None = None,
     feedback: str | None = None,
-) -> str:
-    """Return a subtext — the writer's opinion about a news topic.
+) -> tuple[str, list[ModelMessage]]:
+    """Return a subtext — the writer's opinion about a news topic — and the
+    conversation history that produced it.
 
-    Pass `previous_subtext` and `feedback` from a failed grading to request a
-    rewrite that addresses the grader's corrections.
+    To request a rewrite after a failed grading, pass back the returned
+    `history` along with the grader's `feedback`; the model then sees its
+    previous attempts as prior turns of the conversation.
     """
-    prompt = load_prompt("generate-subtext.md", TOPIC=topic)
+    if history is None:
+        prompt = load_prompt("generate-subtext.md", TOPIC=topic)
+        history = [ModelRequest.user_text_prompt(prompt)]
     if feedback:
-        prompt += (
-            "\n## Previous Attempt\n\n"
-            f"{previous_subtext}\n\n"
-            "## Feedback\n\n"
-            f"{feedback}\n\n"
-            "Rewrite the subtext to address the feedback."
+        history.append(
+            ModelRequest.user_text_prompt(
+                "The subtext failed evaluation with this feedback:\n\n"
+                f"{feedback}\n\n"
+                "Rewrite the subtext to address the feedback. Return only the"
+                " subtext sentence."
+            )
         )
 
-    response = model_request_sync(
-        settings.model,
-        [ModelRequest.user_text_prompt(prompt)],
-    )
+    response = model_request_sync(settings.model, history)
+    history.append(response)
 
     # The prompt forbids surrounding quotes, but strip them if they slip through.
-    return response_text(response).strip().strip('"“”')
+    return response_text(response).strip().strip('"“”'), history
 
 
 def grade_subtext(topic: str, subtext: str) -> Grade:
@@ -118,10 +121,10 @@ def main():
     topic = scan_news(num_topics=1)[0]
     print(f"Topic: {topic}")
 
-    subtext = None
+    history = None
     feedback = None
     for attempt in range(1, settings.max_grade_attempts + 1):
-        subtext = generate_subtext(topic, previous_subtext=subtext, feedback=feedback)
+        subtext, history = generate_subtext(topic, history=history, feedback=feedback)
         grade = grade_subtext(topic, subtext)
         if grade.passed:
             break

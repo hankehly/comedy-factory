@@ -9,6 +9,12 @@ writer's opinion, the idea the eventual joke communicates.
 
 Step 3 — Grade subtext: evaluation gate. If the subtext breaks a rule, the
 workflow re-runs step 2 with the grader's feedback.
+
+Step 4 — Generate joke: LLM step that filters the subtext through a "funny
+filter" (irony, character, shock, hyperbole) into a short joke.
+
+Step 5 — Grade joke: evaluation gate. If the joke breaks a rule, the workflow
+re-runs step 4 with the grader's feedback.
 """
 
 import re
@@ -100,9 +106,51 @@ def generate_subtext(
     return response_text(response).strip().strip('"“”'), history
 
 
+def generate_joke(
+    subtext: str,
+    history: list[ModelMessage] | None = None,
+    feedback: str | None = None,
+) -> tuple[str, list[ModelMessage]]:
+    """Return a joke communicating the subtext, and the conversation history
+    that produced it.
+
+    To request a rewrite after a failed grading, pass back the returned
+    `history` along with the grader's `feedback`; the model then sees its
+    previous attempts as prior turns of the conversation.
+    """
+    if history is None:
+        prompt = load_prompt("generate-joke.md", SUBTEXT=subtext)
+        history = [ModelRequest.user_text_prompt(prompt)]
+    if feedback:
+        history.append(
+            ModelRequest.user_text_prompt(
+                load_prompt("rewrite-with-feedback.md", FEEDBACK=feedback)
+            )
+        )
+
+    response = model_request_sync(settings.model, history)
+    history.append(response)
+
+    # The prompt forbids surrounding quotes, but strip them if they slip through.
+    return response_text(response).strip().strip('"“”'), history
+
+
 def grade_subtext(topic: str, subtext: str) -> Grade:
     """Evaluate a subtext against the rules; a fail comes with feedback."""
     prompt = load_prompt("evaluate-subtext.md", TOPIC=topic, SUBTEXT=subtext)
+
+    response = model_request_sync(
+        settings.model,
+        [ModelRequest.user_text_prompt(prompt)],
+        model_request_parameters=_grade_request_parameters,
+    )
+
+    return Grade.model_validate_json(response_text(response))
+
+
+def grade_joke(subtext: str, joke: str) -> Grade:
+    """Evaluate a joke against the rules; a fail comes with feedback."""
+    prompt = load_prompt("evaluate-joke.md", SUBTEXT=subtext, JOKE=joke)
 
     response = model_request_sync(
         settings.model,
@@ -121,7 +169,7 @@ def main():
     history = None
     feedback = None
     for attempt in range(1, settings.max_grade_attempts + 1):
-        subtext, history = generate_subtext(topic, history=history, feedback=feedback)
+        subtext, history = generate_subtext(topic, history, feedback)
         grade = grade_subtext(topic, subtext)
         if grade.passed:
             break
@@ -132,6 +180,21 @@ def main():
             f"Subtext failed grading after {settings.max_grade_attempts} attempts"
         )
     print(f"Subtext: {subtext}")
+
+    history = None
+    feedback = None
+    for attempt in range(1, settings.max_grade_attempts + 1):
+        joke, history = generate_joke(subtext, history, feedback)
+        grade = grade_joke(subtext, joke)
+        if grade.passed:
+            break
+        feedback = grade.feedback
+        print(f"Joke failed grading (attempt {attempt}):\n{feedback}")
+    else:
+        raise RuntimeError(
+            f"Joke failed grading after {settings.max_grade_attempts} attempts"
+        )
+    print(f"Joke: {joke}")
 
 
 if __name__ == "__main__":

@@ -17,7 +17,9 @@ from comedy_factory import joke_generator
 from comedy_factory.joke_generator import (
     Grade,
     _scan_news_agent,
+    generate_joke,
     generate_subtext,
+    grade_joke,
     grade_subtext,
     scan_news,
 )
@@ -57,6 +59,13 @@ def test_generate_subtext_retry_extends_history(monkeypatch):
     assert "Too wordy" in history[2].parts[0].content
 
 
+def test_generate_joke(monkeypatch):
+    monkeypatch.setattr(settings, "model", canned_model('"A fake joke."'))
+    joke, history = generate_joke("A fake subtext.")
+    assert joke == "A fake joke."
+    assert len(history) == 2
+
+
 def test_grade_subtext_pass(monkeypatch):
     canned = Grade(passed=True).model_dump_json()
     monkeypatch.setattr(settings, "model", canned_model(canned))
@@ -73,10 +82,21 @@ def test_grade_subtext_fail(monkeypatch):
     assert grade.feedback == "* Not a simple sentence."
 
 
+def test_grade_joke_fail(monkeypatch):
+    canned = Grade(passed=False, feedback="* The funny part is not last.").model_dump_json()
+    monkeypatch.setattr(settings, "model", canned_model(canned))
+    grade = grade_joke("A fake subtext.", "A fake joke.")
+    assert not grade.passed
+    assert grade.feedback == "* The funny part is not last."
+
+
 def _pipeline_model(messages: list, info: AgentInfo) -> ModelResponse:
-    """Play both direct-call steps: grading requests carry an output schema."""
+    """Play every direct-call step: grading requests carry an output schema;
+    generation requests are told apart by their prompt heading."""
     if info.model_request_parameters.output_object is not None:
         text = Grade(passed=True).model_dump_json()
+    elif "# Generate Joke" in messages[0].parts[0].content:
+        text = "A fake joke."
     else:
         text = "A fake subtext."
     return ModelResponse(parts=[TextPart(content=text)])
@@ -90,3 +110,29 @@ def test_main_smoke(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "Topic: A fake topic." in out
     assert "Subtext: A fake subtext." in out
+    assert "Joke: A fake joke." in out
+
+
+def test_main_retries_failed_joke_grading(monkeypatch, capsys):
+    joke_grades = iter(
+        [Grade(passed=False, feedback="* The funny part is not last."), Grade(passed=True)]
+    )
+
+    def model(messages: list, info: AgentInfo) -> ModelResponse:
+        content = messages[0].parts[0].content
+        if info.model_request_parameters.output_object is not None:
+            grade = next(joke_grades) if "# Evaluate Joke" in content else Grade(passed=True)
+            text = grade.model_dump_json()
+        elif "# Generate Joke" in content:
+            text = "A fake joke."
+        else:
+            text = "A fake subtext."
+        return ModelResponse(parts=[TextPart(content=text)])
+
+    monkeypatch.setattr(settings, "model", FunctionModel(model, profile=_PROFILE))
+    with _scan_news_agent.override(model=canned_model("A fake topic."), native_tools=[]):
+        joke_generator.main()
+
+    out = capsys.readouterr().out
+    assert "Joke failed grading (attempt 1):\n* The funny part is not last." in out
+    assert "Joke: A fake joke." in out

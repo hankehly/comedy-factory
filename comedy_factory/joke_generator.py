@@ -89,10 +89,7 @@ def generate_subtext(
     if feedback:
         history.append(
             ModelRequest.user_text_prompt(
-                "The subtext failed evaluation with this feedback:\n\n"
-                f"{feedback}\n\n"
-                "Rewrite the subtext to address the feedback. Return only the"
-                " subtext sentence."
+                load_prompt("rewrite-with-feedback.md", FEEDBACK=feedback)
             )
         )
 

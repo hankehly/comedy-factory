@@ -10,6 +10,7 @@ class Settings(BaseSettings):
 
     model: str = "google:gemini-3.6-flash"
     prompts_dir: Path = Path(__file__).parent.parent / "prompts"
+    max_grade_attempts: int = 3
 
 
 settings = Settings()

@@ -317,13 +317,17 @@ wheels = [
 [[package]]
 name = "comedy-factory"
 version = "0.1.0"
-source = { virtual = "." }
+source = { editable = "." }
 dependencies = [
     { name = "pydantic-ai" },
+    { name = "pydantic-settings" },
 ]
 
 [package.metadata]
-requires-dist = [{ name = "pydantic-ai", extras = ["google"], specifier = ">=2.27.0" }]
+requires-dist = [
+    { name = "pydantic-ai", extras = ["google"], specifier = ">=2.27.0" },
+    { name = "pydantic-settings", specifier = ">=2.15.0" },
+]
 
 [[package]]
 name = "cryptography"

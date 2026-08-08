@@ -8,7 +8,7 @@ flowchart TD
     classDef llm fill:#dbeafe,stroke:#2563eb,color:#1e3a8a
     classDef system fill:#dcfce7,stroke:#16a34a,color:#14532d
 
-    s1(["Scan news for trends"]):::agent
+    s1(["Scan news for topics"]):::agent
     s2(["Generate subtext"]):::llm
     s3{"Grade subtext"}:::llm
     s4(["Generate Joke"]):::llm

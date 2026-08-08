@@ -48,7 +48,7 @@ class Grade(BaseModel):
 # Scanning news is a genuine agent step (search tool loop); the subtext steps
 # are single model calls made directly via model_request_sync.
 _scan_news_agent = Agent(
-    settings.model,
+    settings.scan_news_model,
     name="scan_news",
     capabilities=[WebSearch()],
 )

@@ -45,6 +45,35 @@ class Grade(BaseModel):
     )
 
 
+class Subtext(BaseModel):
+    """A subtext — the writer's opinion that a joke communicates."""
+
+    text: str = Field(
+        description=(
+            "The subtext sentence and nothing else — no preamble, no"
+            " explanation, no surrounding quotation marks."
+        )
+    )
+
+
+class Joke(BaseModel):
+    """A joke and the reasoning behind its construction."""
+
+    text: str = Field(
+        description=(
+            "The joke and nothing else — no preamble, no explanation, no"
+            " surrounding quotation marks."
+        )
+    )
+    rationale: str = Field(
+        description=(
+            "A short description of how the joke was created: which funny"
+            " filter(s) were used and how the joke reveals the subtext to the"
+            " reader."
+        )
+    )
+
+
 # Scanning news is a genuine agent step (search tool loop); the subtext steps
 # are single model calls made directly via model_request_sync.
 _scan_news_agent = Agent(
@@ -58,6 +87,22 @@ _grade_request_parameters = ModelRequestParameters(
     output_object=OutputObjectDefinition(
         name=Grade.__name__,
         json_schema=Grade.model_json_schema(),
+    ),
+)
+
+_subtext_request_parameters = ModelRequestParameters(
+    output_mode="native",
+    output_object=OutputObjectDefinition(
+        name=Subtext.__name__,
+        json_schema=Subtext.model_json_schema(),
+    ),
+)
+
+_joke_request_parameters = ModelRequestParameters(
+    output_mode="native",
+    output_object=OutputObjectDefinition(
+        name=Joke.__name__,
+        json_schema=Joke.model_json_schema(),
     ),
 )
 
@@ -81,7 +126,7 @@ def generate_subtext(
     topic: str,
     history: list[ModelMessage] | None = None,
     feedback: str | None = None,
-) -> tuple[str, list[ModelMessage]]:
+) -> tuple[Subtext, list[ModelMessage]]:
     """Return a subtext — the writer's opinion about a news topic — and the
     conversation history that produced it.
 
@@ -99,20 +144,23 @@ def generate_subtext(
             )
         )
 
-    response = model_request_sync(settings.model, history)
+    response = model_request_sync(
+        settings.model,
+        history,
+        model_request_parameters=_subtext_request_parameters,
+    )
     history.append(response)
 
-    # The prompt forbids surrounding quotes, but strip them if they slip through.
-    return response_text(response).strip().strip('"“”'), history
+    return Subtext.model_validate_json(response_text(response)), history
 
 
 def generate_joke(
     subtext: str,
     history: list[ModelMessage] | None = None,
     feedback: str | None = None,
-) -> tuple[str, list[ModelMessage]]:
-    """Return a joke communicating the subtext, and the conversation history
-    that produced it.
+) -> tuple[Joke, list[ModelMessage]]:
+    """Return a joke communicating the subtext — along with the rationale
+    behind its construction — and the conversation history that produced it.
 
     To request a rewrite after a failed grading, pass back the returned
     `history` along with the grader's `feedback`; the model then sees its
@@ -128,11 +176,14 @@ def generate_joke(
             )
         )
 
-    response = model_request_sync(settings.model, history)
+    response = model_request_sync(
+        settings.model,
+        history,
+        model_request_parameters=_joke_request_parameters,
+    )
     history.append(response)
 
-    # The prompt forbids surrounding quotes, but strip them if they slip through.
-    return response_text(response).strip().strip('"“”'), history
+    return Joke.model_validate_json(response_text(response)), history
 
 
 def grade_subtext(topic: str, subtext: str) -> Grade:
@@ -170,7 +221,7 @@ def main():
     feedback = None
     for attempt in range(1, settings.max_grade_attempts + 1):
         subtext, history = generate_subtext(topic, history, feedback)
-        grade = grade_subtext(topic, subtext)
+        grade = grade_subtext(topic, subtext.text)
         if grade.passed:
             break
         feedback = grade.feedback
@@ -179,13 +230,13 @@ def main():
         raise RuntimeError(
             f"Subtext failed grading after {settings.max_grade_attempts} attempts"
         )
-    print(f"Subtext: {subtext}")
+    print(f"Subtext: {subtext.text}")
 
     history = None
     feedback = None
     for attempt in range(1, settings.max_grade_attempts + 1):
-        joke, history = generate_joke(subtext, history, feedback)
-        grade = grade_joke(subtext, joke)
+        joke, history = generate_joke(subtext.text, history, feedback)
+        grade = grade_joke(subtext.text, joke.text)
         if grade.passed:
             break
         feedback = grade.feedback
@@ -194,7 +245,8 @@ def main():
         raise RuntimeError(
             f"Joke failed grading after {settings.max_grade_attempts} attempts"
         )
-    print(f"Joke: {joke}")
+    print(f"Joke: {joke.text}")
+    print(f"Rationale: {joke.rationale}")
 
 
 if __name__ == "__main__":

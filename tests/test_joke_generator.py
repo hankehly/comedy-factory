@@ -16,6 +16,8 @@ from pydantic_ai.profiles import ModelProfile
 from comedy_factory import joke_generator
 from comedy_factory.joke_generator import (
     Grade,
+    Joke,
+    Subtext,
     _scan_news_agent,
     generate_joke,
     generate_subtext,
@@ -41,28 +43,32 @@ def test_scan_news_returns_bare_topic():
     assert topic == "A fake topic."
 
 
-def test_generate_subtext_strips_quotes(monkeypatch):
-    monkeypatch.setattr(settings, "model", canned_model('"A fake subtext."'))
+def test_generate_subtext(monkeypatch):
+    canned = Subtext(text="A fake subtext.").model_dump_json()
+    monkeypatch.setattr(settings, "model", canned_model(canned))
     subtext, history = generate_subtext("A fake topic.")
-    assert subtext == "A fake subtext."
+    assert subtext.text == "A fake subtext."
     assert len(history) == 2  # templated prompt + model response
 
 
 def test_generate_subtext_retry_extends_history(monkeypatch):
-    monkeypatch.setattr(settings, "model", canned_model("A better subtext."))
+    canned = Subtext(text="A better subtext.").model_dump_json()
+    monkeypatch.setattr(settings, "model", canned_model(canned))
     _, history = generate_subtext("A fake topic.")
     subtext, history = generate_subtext(
         "A fake topic.", history=history, feedback="* Too wordy."
     )
-    assert subtext == "A better subtext."
+    assert subtext.text == "A better subtext."
     assert len(history) == 4  # prompt, first attempt, feedback, rewrite
     assert "Too wordy" in history[2].parts[0].content
 
 
 def test_generate_joke(monkeypatch):
-    monkeypatch.setattr(settings, "model", canned_model('"A fake joke."'))
+    canned = Joke(text="A fake joke.", rationale="Irony.").model_dump_json()
+    monkeypatch.setattr(settings, "model", canned_model(canned))
     joke, history = generate_joke("A fake subtext.")
-    assert joke == "A fake joke."
+    assert joke.text == "A fake joke."
+    assert joke.rationale == "Irony."
     assert len(history) == 2
 
 
@@ -91,14 +97,17 @@ def test_grade_joke_fail(monkeypatch):
 
 
 def _pipeline_model(messages: list, info: AgentInfo) -> ModelResponse:
-    """Play every direct-call step: grading requests carry an output schema;
-    generation requests are told apart by their prompt heading."""
-    if info.model_request_parameters.output_object is not None:
+    """Play every direct-call step, told apart by their output schemas."""
+    output_object = info.model_request_parameters.output_object
+    schema_name = output_object.name if output_object is not None else None
+    if schema_name == "Grade":
         text = Grade(passed=True).model_dump_json()
-    elif "# Generate Joke" in messages[0].parts[0].content:
-        text = "A fake joke."
+    elif schema_name == "Joke":
+        text = Joke(text="A fake joke.", rationale="Irony.").model_dump_json()
+    elif schema_name == "Subtext":
+        text = Subtext(text="A fake subtext.").model_dump_json()
     else:
-        text = "A fake subtext."
+        raise AssertionError(f"Unexpected request schema: {schema_name}")
     return ModelResponse(parts=[TextPart(content=text)])
 
 
@@ -111,6 +120,7 @@ def test_main_smoke(monkeypatch, capsys):
     assert "Topic: A fake topic." in out
     assert "Subtext: A fake subtext." in out
     assert "Joke: A fake joke." in out
+    assert "Rationale: Irony." in out
 
 
 def test_main_retries_failed_joke_grading(monkeypatch, capsys):
@@ -120,13 +130,17 @@ def test_main_retries_failed_joke_grading(monkeypatch, capsys):
 
     def model(messages: list, info: AgentInfo) -> ModelResponse:
         content = messages[0].parts[0].content
-        if info.model_request_parameters.output_object is not None:
+        output_object = info.model_request_parameters.output_object
+        schema_name = output_object.name if output_object is not None else None
+        if schema_name == "Grade":
             grade = next(joke_grades) if "# Evaluate Joke" in content else Grade(passed=True)
             text = grade.model_dump_json()
-        elif "# Generate Joke" in content:
-            text = "A fake joke."
+        elif schema_name == "Joke":
+            text = Joke(text="A fake joke.", rationale="Irony.").model_dump_json()
+        elif schema_name == "Subtext":
+            text = Subtext(text="A fake subtext.").model_dump_json()
         else:
-            text = "A fake subtext."
+            raise AssertionError(f"Unexpected request schema: {schema_name}")
         return ModelResponse(parts=[TextPart(content=text)])
 
     monkeypatch.setattr(settings, "model", FunctionModel(model, profile=_PROFILE))

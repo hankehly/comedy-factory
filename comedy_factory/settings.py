@@ -1,5 +1,6 @@
 """Shared settings for the comedy factory workflows."""
 
+import os
 from pathlib import Path
 from typing import Literal
 
@@ -20,6 +21,11 @@ class Settings(BaseSettings):
     output_dir: Path = Path(__file__).parent.parent / "output"
     max_grade_attempts: int = 3
 
+    # Vertex AI region for the google-cloud: models. Newer Gemini models are
+    # served from the "global" endpoint, not the provider's us-central1
+    # default. The env var is unprefixed by Google convention.
+    google_cloud_location: str = Field("global", validation_alias="GOOGLE_CLOUD_LOCATION")
+
     # Image generation. `image_provider` picks the backend; each provider keeps
     # its own model setting so switching back and forth is a one-variable flip.
     image_provider: Literal["google", "cloudflare"] = "google"
@@ -33,3 +39,8 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+
+# pydantic-ai's google-cloud provider reads GOOGLE_CLOUD_LOCATION from the
+# environment when a model is constructed, so make the setting authoritative
+# whenever the variable isn't already set.
+os.environ.setdefault("GOOGLE_CLOUD_LOCATION", settings.google_cloud_location)

@@ -4,6 +4,7 @@
 # Secret prompt content — bootstrap with `just init-prompts` from *.template.md
 prompts/generate-subtext.md
 prompts/evaluate-subtext.md
+prompts/generate-joke.md
 
 # Python
 __pycache__/

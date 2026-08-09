@@ -34,11 +34,11 @@ def canned_model(text: str) -> TestModel:
     return TestModel(custom_output_text=text, profile=_PROFILE)
 
 
-def test_scan_news_parses_topics():
-    canned = "* First fake topic.\n\n2. Second fake topic.\n"
+def test_scan_news_returns_bare_topic():
+    canned = "* A fake topic.\n\nSome trailing explanation."
     with _scan_news_agent.override(model=canned_model(canned), native_tools=[]):
-        topics = scan_news(num_topics=2)
-    assert topics == ["First fake topic.", "Second fake topic."]
+        topic = scan_news()
+    assert topic == "A fake topic."
 
 
 def test_generate_subtext_strips_quotes(monkeypatch):

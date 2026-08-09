@@ -62,19 +62,19 @@ _grade_request_parameters = ModelRequestParameters(
 )
 
 
-def scan_news(num_topics: int = 1) -> list[str]:
-    """Return `num_topics` factual news topics suitable for joke writing."""
-    prompt = load_prompt("scan-news.md", NUM_TOPICS=num_topics)
+def scan_news() -> str:
+    """Return a factual news topic suitable for joke writing."""
+    prompt = load_prompt("scan-news.md")
 
     result = _scan_news_agent.run_sync(prompt)
 
-    topics = []
+    # The prompt demands a bare one-line topic; strip any numbering/bullets or
+    # extra lines that slip through anyway.
     for line in result.output.splitlines():
-        # The prompt forbids numbering/bullets, but strip them if they slip through.
         topic = re.sub(r"^\s*(?:[-*•]|\d+[.)])\s*", "", line).strip()
         if topic:
-            topics.append(topic)
-    return topics
+            return topic
+    raise RuntimeError("News scan returned no topic")
 
 
 def generate_subtext(
@@ -163,7 +163,7 @@ def grade_joke(subtext: str, joke: str) -> Grade:
 
 def main():
     """Execute the joke generator workflow."""
-    topic = scan_news(num_topics=1)[0]
+    topic = scan_news()
     print(f"Topic: {topic}")
 
     history = None

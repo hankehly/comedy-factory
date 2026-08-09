@@ -21,4 +21,13 @@ packages = ["comedy_factory"]
 [dependency-groups]
 dev = [
     "pytest>=9.1.1",
+    "pytest-cov>=7.1.0",
+]
+
+[tool.pytest.ini_options]
+filterwarnings = [
+    # pydantic_graph calls asyncio.get_event_loop() in sync runs, which
+    # Python 3.12 deprecates; nothing to fix on our side (present in the
+    # latest release, 2.27.0).
+    "ignore:There is no current event loop:DeprecationWarning:pydantic_graph",
 ]

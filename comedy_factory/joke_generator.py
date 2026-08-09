@@ -42,6 +42,7 @@ from datetime import datetime
 from pathlib import Path
 
 import httpx
+from loguru import logger
 from PIL import Image, ImageDraw, ImageFont
 
 from pydantic import BaseModel, Field
@@ -399,7 +400,7 @@ def save_asset(
 def main():
     """Execute the joke generator workflow."""
     topic = scan_news()
-    print(f"Topic: {topic}")
+    logger.info(f"Topic: {topic}")
 
     history = None
     feedback = None
@@ -409,12 +410,12 @@ def main():
         if grade.passed:
             break
         feedback = grade.feedback
-        print(f"Subtext failed grading (attempt {attempt}):\n{feedback}")
+        logger.warning(f"Subtext failed grading (attempt {attempt}):\n{feedback}")
     else:
         raise RuntimeError(
             f"Subtext failed grading after {settings.max_grade_attempts} attempts"
         )
-    print(f"Subtext: {subtext.text}")
+    logger.info(f"Subtext: {subtext.text}")
 
     history = None
     feedback = None
@@ -424,16 +425,16 @@ def main():
         if grade.passed:
             break
         feedback = grade.feedback
-        print(f"Joke failed grading (attempt {attempt}):\n{feedback}")
+        logger.warning(f"Joke failed grading (attempt {attempt}):\n{feedback}")
     else:
         raise RuntimeError(
             f"Joke failed grading after {settings.max_grade_attempts} attempts"
         )
-    print(f"Joke: {joke.text}")
-    print(f"Rationale: {joke.rationale}")
+    logger.info(f"Joke: {joke.text}")
+    logger.info(f"Rationale: {joke.rationale}")
 
     image_prompt = write_image_prompt(joke)
-    print(f"Image prompt: {image_prompt.text}")
+    logger.info(f"Image prompt: {image_prompt.text}")
 
     image = generate_image(image_prompt)
     captioned = render_caption(image, joke.text)
@@ -442,7 +443,7 @@ def main():
     bundle_dir = save_asset(
         topic, subtext, joke, image_prompt, captioned, evaluation
     )
-    print(f"Asset bundle saved to {bundle_dir}")
+    logger.info(f"Asset bundle saved to {bundle_dir}")
 
 
 if __name__ == "__main__":

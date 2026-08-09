@@ -61,6 +61,15 @@ FAKE_IMAGE_BYTES = _tiny_jpeg()
 
 
 @pytest.fixture
+def log_output():
+    """Capture loguru messages emitted during the test."""
+    messages: list[str] = []
+    handler_id = joke_generator.logger.add(messages.append, format="{message}")
+    yield messages
+    joke_generator.logger.remove(handler_id)
+
+
+@pytest.fixture
 def image_api_calls(monkeypatch):
     """Stub the Cloudflare image API at the httpx level; records POST calls."""
     calls = []
@@ -244,13 +253,13 @@ def _pipeline_model(messages: list, info: AgentInfo) -> ModelResponse:
     return ModelResponse(parts=[TextPart(content=text)])
 
 
-def test_main_smoke(monkeypatch, capsys, tmp_path, image_api_calls):
+def test_main_smoke(monkeypatch, tmp_path, image_api_calls, log_output):
     _set_all_step_models(monkeypatch, FunctionModel(_pipeline_model, profile=_PROFILE))
     monkeypatch.setattr(settings, "output_dir", tmp_path / "output")
     with _scan_news_agent.override(model=canned_model("A fake topic."), native_tools=[]):
         joke_generator.main()
 
-    out = capsys.readouterr().out
+    out = "".join(log_output)
     assert "Topic: A fake topic." in out
     assert "Subtext: A fake subtext." in out
     assert "Joke: A fake joke." in out
@@ -268,7 +277,7 @@ def test_main_smoke(monkeypatch, capsys, tmp_path, image_api_calls):
     assert metadata["joke"]["text"] == "A fake joke."
 
 
-def test_main_retries_failed_joke_grading(monkeypatch, capsys, tmp_path, image_api_calls):
+def test_main_retries_failed_joke_grading(monkeypatch, tmp_path, image_api_calls, log_output):
     joke_grades = iter(
         [Grade(passed=False, feedback="* The funny part is not last."), Grade(passed=True)]
     )
@@ -295,6 +304,6 @@ def test_main_retries_failed_joke_grading(monkeypatch, capsys, tmp_path, image_a
     with _scan_news_agent.override(model=canned_model("A fake topic."), native_tools=[]):
         joke_generator.main()
 
-    out = capsys.readouterr().out
+    out = "".join(log_output)
     assert "Joke failed grading (attempt 1):\n* The funny part is not last." in out
     assert "Joke: A fake joke." in out

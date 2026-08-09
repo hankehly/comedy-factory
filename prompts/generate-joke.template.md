@@ -1,6 +1,6 @@
 # Generate Joke
 
-Your task is to write a joke by filtering the subtext below through one or more of the funny filters described in this document.
+Your task is to write a joke by reinterpreting the subtext below through one or more of the funny filters described in this document.
 
 ## Rules
 

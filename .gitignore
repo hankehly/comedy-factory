@@ -1,6 +1,10 @@
 # Secrets
 .env
 
+# Secret prompt content — bootstrap with `just init-prompts` from *.template.md
+prompts/generate-subtext.md
+prompts/evaluate-subtext.md
+
 # Python
 __pycache__/
 *.py[cod]

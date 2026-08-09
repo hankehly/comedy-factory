@@ -20,7 +20,8 @@ from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.models.test import TestModel
 from pydantic_ai.profiles import ModelProfile
 
-from comedy_factory import joke_generator
+from comedy_factory import joke_generator, recaption
+from comedy_factory.captioning import _wrap_caption, render_caption
 from comedy_factory.joke_generator import (
     Grade,
     ImagePrompt,
@@ -28,14 +29,12 @@ from comedy_factory.joke_generator import (
     Subtext,
     Topic,
     _find_topic_agent,
-    _wrap_caption,
     grade_asset,
     generate_image,
     generate_joke,
     generate_subtext,
     grade_joke,
     grade_subtext,
-    render_caption,
     save_asset,
     find_topic,
     write_image_prompt,
@@ -233,6 +232,35 @@ def test_wrap_caption_wraps_to_width():
     assert " ".join(lines) == caption  # no words lost or reordered
 
 
+def test_recaption_rewrites_from_original_and_keeps_versions(tmp_path, capsys):
+    bundle_dir = tmp_path / "20260101-000000"
+    bundle_dir.mkdir()
+    (bundle_dir / "image-original.jpg").write_bytes(FAKE_IMAGE_BYTES)
+
+    # The first rewrite fills the pipeline's canonical file name; later
+    # rewrites get new datetime-stamped files — later stamps are newer.
+    recaption.main([str(bundle_dir), "A rewritten caption."])
+    recaption.main([str(bundle_dir), "A second, much longer rewritten caption."])
+    recaption.main([str(bundle_dir), "A third rewritten caption, longest of them all."])
+
+    stamped = sorted(bundle_dir.glob("image-captioned-*.jpg"))
+    assert len(stamped) == 2
+    versions = [(bundle_dir / "image-captioned.jpg").read_bytes()] + [
+        path.read_bytes() for path in stamped
+    ]
+
+    assert (bundle_dir / "image-original.jpg").read_bytes() == FAKE_IMAGE_BYTES
+    assert len(set(versions)) == 3
+    for captioned in versions:
+        image = Image.open(io.BytesIO(captioned))
+        assert image.height > 48  # caption bar appended below the 48px original
+
+
+def test_recaption_requires_original_image(tmp_path):
+    with pytest.raises(SystemExit):
+        recaption.main([str(tmp_path), "A caption."])
+
+
 def test_grade_subtext_pass(monkeypatch):
     canned = Grade(passed=True).model_dump_json()
     monkeypatch.setattr(settings, "grade_subtext_model", canned_model(canned))
@@ -275,12 +303,14 @@ def test_save_asset(monkeypatch, tmp_path):
         subtext=Subtext(text="A fake subtext."),
         joke=Joke(text="A fake joke.", rationale="Irony."),
         image_prompt=ImagePrompt(text="A fake image prompt."),
+        image=b"original-bytes",
         captioned_image=FAKE_IMAGE_BYTES,
         evaluation=Grade(passed=True),
     )
 
     assert bundle_dir.parent == tmp_path / "output"
-    assert (bundle_dir / "image.jpg").read_bytes() == FAKE_IMAGE_BYTES
+    assert (bundle_dir / "image-original.jpg").read_bytes() == b"original-bytes"
+    assert (bundle_dir / "image-captioned.jpg").read_bytes() == FAKE_IMAGE_BYTES
     metadata = json.loads((bundle_dir / "metadata.json").read_text())
     assert metadata["topic"]["text"] == "A fake topic."
     assert metadata["topic"]["source_url"] == "https://example.com/story"
@@ -343,8 +373,9 @@ def test_main_smoke(monkeypatch, tmp_path, log_output):
     assert "Asset bundle saved to" in out
 
     [bundle_dir] = list((tmp_path / "output").iterdir())
-    # The saved image is the generated image plus the rendered caption bar.
-    saved = Image.open(bundle_dir / "image.jpg")
+    assert (bundle_dir / "image-original.jpg").read_bytes() == FAKE_IMAGE_BYTES
+    # The captioned image is the generated image plus the rendered caption bar.
+    saved = Image.open(bundle_dir / "image-captioned.jpg")
     assert saved.format == "JPEG"
     assert saved.width == 64
     assert saved.height > 48

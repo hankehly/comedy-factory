@@ -31,12 +31,11 @@ Step 9 — Evaluate joke holistically: evaluation of the finished asset as a
 whole. Placeholder for now — the criteria are undecided, so everything passes;
 the verdict is recorded in the asset bundle rather than blocking it.
 
-Step 10 — Save asset bundle: system step that writes the run's artifacts
-(captioned image plus metadata) to a timestamped output directory.
+Step 10 — Save asset: system step that writes the run's artifacts (original
+image, captioned image, and metadata) to a timestamped output directory.
 """
 
 import base64
-import io
 import json
 import re
 from datetime import datetime
@@ -44,7 +43,6 @@ from pathlib import Path
 
 import httpx
 from loguru import logger
-from PIL import Image, ImageDraw, ImageFont
 
 from pydantic import BaseModel, Field
 from pydantic_ai import Agent
@@ -54,6 +52,7 @@ from pydantic_ai.messages import ModelMessage, ModelRequest
 from pydantic_ai.models import ModelRequestParameters
 from pydantic_ai.output import OutputObjectDefinition
 
+from comedy_factory.captioning import render_caption
 from comedy_factory.prompts import load_prompt
 from comedy_factory.settings import settings
 from comedy_factory.utils import response_image, response_text
@@ -328,68 +327,6 @@ def _generate_image_cloudflare(image_prompt: ImagePrompt) -> bytes:
     return base64.b64decode(payload["result"]["image"])
 
 
-def _wrap_caption(
-    caption: str, font: ImageFont.FreeTypeFont, max_width: int
-) -> list[str]:
-    """Greedily wrap the caption into lines at most `max_width` pixels wide.
-
-    A single word wider than `max_width` gets its own (overflowing) line.
-    """
-    lines: list[str] = []
-    line = ""
-    for word in caption.split():
-        candidate = f"{line} {word}".strip()
-        if line and font.getlength(candidate) > max_width:
-            lines.append(line)
-            line = word
-        else:
-            line = candidate
-    if line:
-        lines.append(line)
-    return lines
-
-
-def render_caption(image: bytes, caption: str) -> bytes:
-    """Return the image extended with a white caption bar showing the joke."""
-    base = Image.open(io.BytesIO(image)).convert("RGB")
-
-    # Scale typography with image width so captions look the same at any
-    # resolution. load_default(size=...) uses Pillow's embedded vector font,
-    # so no font file needs to ship with the project.
-    font_size = max(16, base.width // 20)
-    padding = font_size
-    spacing = font_size // 3
-    font = ImageFont.load_default(size=font_size)
-
-    lines = _wrap_caption(caption, font, base.width - 2 * padding)
-    text = "\n".join(lines)
-
-    draw = ImageDraw.Draw(base)
-    bbox = draw.multiline_textbbox((0, 0), text, font=font, spacing=spacing)
-
-    canvas = Image.new(
-        "RGB",
-        (base.width, base.height + (bbox[3] - bbox[1]) + 2 * padding),
-        "white",
-    )
-    canvas.paste(base, (0, 0))
-    ImageDraw.Draw(canvas).multiline_text(
-        (
-            (base.width - (bbox[2] - bbox[0])) // 2 - bbox[0],
-            base.height + padding - bbox[1],
-        ),
-        text,
-        font=font,
-        fill="black",
-        spacing=spacing,
-        align="center",
-    )
-
-    buffer = io.BytesIO()
-    canvas.save(buffer, format="JPEG", quality=90)
-    return buffer.getvalue()
-
-
 def grade_subtext(topic: str, subtext: str) -> Grade:
     """Evaluate a subtext against the rules; a fail comes with feedback."""
     prompt = load_prompt("evaluate-subtext.md", TOPIC=topic, SUBTEXT=subtext)
@@ -436,6 +373,7 @@ def save_asset(
     subtext: Subtext,
     joke: Joke,
     image_prompt: ImagePrompt,
+    image: bytes,
     captioned_image: bytes,
     evaluation: Grade,
 ) -> Path:
@@ -444,7 +382,8 @@ def save_asset(
     bundle_dir = settings.output_dir / created_at.strftime("%Y%m%d-%H%M%S")
     bundle_dir.mkdir(parents=True, exist_ok=True)
 
-    (bundle_dir / "image.jpg").write_bytes(captioned_image)
+    (bundle_dir / "image-original.jpg").write_bytes(image)
+    (bundle_dir / "image-captioned.jpg").write_bytes(captioned_image)
 
     metadata = {
         "created_at": created_at.isoformat(),
@@ -504,7 +443,7 @@ def main():
 
     evaluation = grade_asset(topic, subtext, joke, captioned)
     bundle_dir = save_asset(
-        topic, subtext, joke, image_prompt, captioned, evaluation
+        topic, subtext, joke, image_prompt, image, captioned, evaluation
     )
     logger.info(f"Asset bundle saved to {bundle_dir}")
 

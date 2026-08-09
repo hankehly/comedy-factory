@@ -20,6 +20,8 @@ class Settings(BaseSettings):
     prompts_dir: Path = Path(__file__).parent.parent / "prompts"
     output_dir: Path = Path(__file__).parent.parent / "output"
     max_grade_attempts: int = 3
+    max_recent_topics: int = 20
+    """How many recent bundle topics to feed the topic scan as stories to avoid."""
 
     # Vertex AI region for the google-cloud: models. Newer Gemini models are
     # served from the "global" endpoint, not the provider's us-central1

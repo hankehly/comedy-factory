@@ -165,10 +165,34 @@ _image_prompt_request_parameters = ModelRequestParameters(
 )
 
 
+def _recent_topics() -> list[str]:
+    """Topic sentences of the newest asset bundles, newest first."""
+    if not settings.output_dir.is_dir():
+        return []
+    topics = []
+    for bundle_dir in sorted(settings.output_dir.iterdir(), reverse=True):
+        metadata_path = bundle_dir / "metadata.json"
+        if not metadata_path.is_file():
+            continue
+        try:
+            topic = json.loads(metadata_path.read_text()).get("topic")
+        except json.JSONDecodeError:
+            continue
+        # Older bundles stored the topic as a bare string.
+        text = topic.get("text") if isinstance(topic, dict) else topic
+        if text:
+            topics.append(text)
+        if len(topics) >= settings.max_recent_topics:
+            break
+    return topics
+
+
 def find_topic() -> Topic:
     """Return a factual news topic suitable for joke writing, with its source
-    URL when the model provides one."""
-    prompt = load_prompt("find-topic.md")
+    URL when the model provides one. Topics of recent asset bundles are passed
+    to the model as stories to avoid."""
+    recent = "\n".join(f"* {topic}" for topic in _recent_topics()) or "(none)"
+    prompt = load_prompt("find-topic.md", RECENT_TOPICS=recent)
 
     result = _find_topic_agent.run_sync(prompt)
 

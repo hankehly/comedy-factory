@@ -13,6 +13,12 @@ The topic must:
 * Contain a deserving target: the comfortable — the status quo, an entrenched power, or an authority, no matter how low-level — doing something ripe for ridicule. Skip stories whose only available target is the downtrodden or victims of a tragedy.
 * Be fresh — avoid comedy-cliché subject matter that has been joked about endlessly.
 
+## Avoid These Stories
+
+Each topic below has already been used. Do not return a topic about any of these stories or events, nor about closely related coverage of them — pick a different story.
+
+{RECENT_TOPICS}
+
 ## Output
 
 Return exactly two lines, with no numbering, preamble, or explanation:

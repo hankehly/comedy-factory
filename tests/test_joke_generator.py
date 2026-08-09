@@ -119,6 +119,34 @@ def test_find_topic_ignores_url_ordering():
     assert topic.source_url == "https://example.com/story"
 
 
+def test_find_topic_feeds_recent_topics_to_prompt(monkeypatch, tmp_path):
+    output_dir = tmp_path / "output"
+    monkeypatch.setattr(settings, "output_dir", output_dir)
+    for name, topic in [
+        ("20260101-000000", {"text": "An old story.", "source_url": None}),
+        ("20260102-000000", "A legacy-format story."),
+    ]:
+        bundle_dir = output_dir / name
+        bundle_dir.mkdir(parents=True)
+        (bundle_dir / "metadata.json").write_text(json.dumps({"topic": topic}))
+
+    prompts = []
+
+    def model(messages: list, info: AgentInfo) -> ModelResponse:
+        prompts.append(messages[0].parts[0].content)
+        return ModelResponse(parts=[TextPart(content="A fresh topic.")])
+
+    with _find_topic_agent.override(
+        model=FunctionModel(model, profile=_PROFILE), native_tools=[]
+    ):
+        topic = find_topic()
+
+    assert topic.text == "A fresh topic."
+    [prompt] = prompts
+    assert "* An old story." in prompt
+    assert "* A legacy-format story." in prompt
+
+
 def test_generate_subtext(monkeypatch):
     canned = Subtext(text="A fake subtext.").model_dump_json()
     monkeypatch.setattr(settings, "generate_subtext_model", canned_model(canned))

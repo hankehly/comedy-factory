@@ -20,8 +20,9 @@ Step 6 — Write image prompt: LLM step that writes a text-to-image prompt for a
 text-free image that plays the joke straight; the joke text is rendered onto
 the image later as a caption.
 
-Step 7 — Generate image: system-adjacent step that renders the image prompt
-with FLUX.1-schnell on Cloudflare Workers AI and returns the JPEG bytes.
+Step 7 — Generate image: renders the image prompt with the configured provider
+— a Gemini image model ("Nano Banana") or FLUX.1-schnell on Cloudflare Workers
+AI — and returns the image bytes.
 
 Step 8 — Render caption: system step that word-wraps the joke text into a
 white caption bar beneath the image and returns the combined JPEG bytes.
@@ -55,7 +56,7 @@ from pydantic_ai.output import OutputObjectDefinition
 
 from comedy_factory.prompts import load_prompt
 from comedy_factory.settings import settings
-from comedy_factory.utils import response_text
+from comedy_factory.utils import response_image, response_text
 
 
 class Grade(BaseModel):
@@ -250,10 +251,27 @@ def write_image_prompt(joke: Joke) -> ImagePrompt:
 
 
 def generate_image(image_prompt: ImagePrompt) -> bytes:
-    """Render the image prompt with Cloudflare Workers AI; returns JPEG bytes."""
+    """Render the image prompt with the configured image provider."""
+    if settings.image_provider == "cloudflare":
+        return _generate_image_cloudflare(image_prompt)
+    return _generate_image_google(image_prompt)
+
+
+def _generate_image_google(image_prompt: ImagePrompt) -> bytes:
+    """Generate the image with a Gemini image model ("Nano Banana")."""
+    response = model_request_sync(
+        settings.google_image_model,
+        [ModelRequest.user_text_prompt(image_prompt.text)],
+        model_request_parameters=ModelRequestParameters(allow_image_output=True),
+    )
+    return response_image(response)
+
+
+def _generate_image_cloudflare(image_prompt: ImagePrompt) -> bytes:
+    """Generate the image with FLUX on Cloudflare Workers AI."""
     response = httpx.post(
         "https://api.cloudflare.com/client/v4/accounts/"
-        f"{settings.cloudflare_account_id}/ai/run/{settings.image_model}",
+        f"{settings.cloudflare_account_id}/ai/run/{settings.cloudflare_image_model}",
         headers={"Authorization": f"Bearer {settings.cloudflare_api_token}"},
         json={"prompt": image_prompt.text},
         timeout=60,

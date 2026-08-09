@@ -15,7 +15,7 @@ import json
 
 import pytest
 from PIL import Image, ImageFont
-from pydantic_ai.messages import ModelResponse, TextPart
+from pydantic_ai.messages import BinaryImage, FilePart, ModelResponse, TextPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.models.test import TestModel
 from pydantic_ai.profiles import ModelProfile
@@ -41,8 +41,9 @@ from comedy_factory.joke_generator import (
 )
 from comedy_factory.settings import settings
 
-# Grading uses output_mode="native"; TestModel's default profile rejects it.
-_PROFILE = ModelProfile(supports_json_schema_output=True)
+# Grading uses output_mode="native" and image generation uses image output;
+# TestModel/FunctionModel default profiles reject both.
+_PROFILE = ModelProfile(supports_json_schema_output=True, supports_image_output=True)
 
 
 def canned_model(text: str) -> TestModel:
@@ -136,7 +137,8 @@ def test_write_image_prompt(monkeypatch):
     assert write_image_prompt(joke).text == "A fake image prompt."
 
 
-def test_generate_image(monkeypatch, image_api_calls):
+def test_generate_image_cloudflare(monkeypatch, image_api_calls):
+    monkeypatch.setattr(settings, "image_provider", "cloudflare")
     monkeypatch.setattr(settings, "cloudflare_account_id", "test-account")
     monkeypatch.setattr(settings, "cloudflare_api_token", "test-token")
 
@@ -145,9 +147,27 @@ def test_generate_image(monkeypatch, image_api_calls):
     assert image == FAKE_IMAGE_BYTES
     (url, kwargs), = image_api_calls
     assert "test-account" in url
-    assert url.endswith(settings.image_model)
+    assert url.endswith(settings.cloudflare_image_model)
     assert kwargs["headers"]["Authorization"] == "Bearer test-token"
     assert kwargs["json"] == {"prompt": "A fake image prompt."}
+
+
+def test_generate_image_google(monkeypatch):
+    def model(messages: list, info: AgentInfo) -> ModelResponse:
+        assert info.model_request_parameters.allow_image_output
+        return ModelResponse(
+            parts=[
+                FilePart(
+                    content=BinaryImage(data=FAKE_IMAGE_BYTES, media_type="image/jpeg")
+                )
+            ]
+        )
+
+    monkeypatch.setattr(settings, "image_provider", "google")
+    monkeypatch.setattr(settings, "google_image_model", FunctionModel(model, profile=_PROFILE))
+
+    image = generate_image(ImagePrompt(text="A fake image prompt."))
+    assert image == FAKE_IMAGE_BYTES
 
 
 def test_render_caption_adds_bar_below_image():
@@ -232,12 +252,20 @@ def _set_all_step_models(monkeypatch, model):
         "generate_joke_model",
         "grade_joke_model",
         "write_image_prompt_model",
+        "google_image_model",
     ):
         monkeypatch.setattr(settings, name, model)
 
 
+_FAKE_IMAGE_RESPONSE = ModelResponse(
+    parts=[FilePart(content=BinaryImage(data=FAKE_IMAGE_BYTES, media_type="image/jpeg"))]
+)
+
+
 def _pipeline_model(messages: list, info: AgentInfo) -> ModelResponse:
     """Play every direct-call step, told apart by their output schemas."""
+    if info.model_request_parameters.allow_image_output:
+        return _FAKE_IMAGE_RESPONSE
     output_object = info.model_request_parameters.output_object
     schema_name = output_object.name if output_object is not None else None
     if schema_name == "Grade":
@@ -253,7 +281,7 @@ def _pipeline_model(messages: list, info: AgentInfo) -> ModelResponse:
     return ModelResponse(parts=[TextPart(content=text)])
 
 
-def test_main_smoke(monkeypatch, tmp_path, image_api_calls, log_output):
+def test_main_smoke(monkeypatch, tmp_path, log_output):
     _set_all_step_models(monkeypatch, FunctionModel(_pipeline_model, profile=_PROFILE))
     monkeypatch.setattr(settings, "output_dir", tmp_path / "output")
     with _scan_news_agent.override(model=canned_model("A fake topic."), native_tools=[]):
@@ -277,12 +305,14 @@ def test_main_smoke(monkeypatch, tmp_path, image_api_calls, log_output):
     assert metadata["joke"]["text"] == "A fake joke."
 
 
-def test_main_retries_failed_joke_grading(monkeypatch, tmp_path, image_api_calls, log_output):
+def test_main_retries_failed_joke_grading(monkeypatch, tmp_path, log_output):
     joke_grades = iter(
         [Grade(passed=False, feedback="* The funny part is not last."), Grade(passed=True)]
     )
 
     def model(messages: list, info: AgentInfo) -> ModelResponse:
+        if info.model_request_parameters.allow_image_output:
+            return _FAKE_IMAGE_RESPONSE
         content = messages[0].parts[0].content
         output_object = info.model_request_parameters.output_object
         schema_name = output_object.name if output_object is not None else None

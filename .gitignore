@@ -5,6 +5,7 @@
 prompts/generate-subtext.md
 prompts/evaluate-subtext.md
 prompts/generate-joke.md
+prompts/evaluate-joke.md
 
 # Python
 __pycache__/

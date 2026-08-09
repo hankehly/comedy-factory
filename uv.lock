@@ -334,7 +334,7 @@ dev = [
 requires-dist = [
     { name = "httpx", specifier = ">=0.28.1" },
     { name = "pillow", specifier = ">=12.3.0" },
-    { name = "pydantic-ai", extras = ["google"], specifier = ">=2.27.0" },
+    { name = "pydantic-ai", specifier = ">=2.27.0" },
     { name = "pydantic-settings", specifier = ">=2.15.0" },
 ]
 

@@ -24,6 +24,7 @@ htmlcov/
 # Workflow output
 output/
 *.jpg
+!docs/*.jpg
 
 # Local notes / scratch space — never committed
 scratch/

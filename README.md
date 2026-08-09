@@ -1,5 +1,7 @@
 # comedy-factory
 
+[![CI](https://github.com/hankehly/comedy-factory/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/hankehly/comedy-factory/actions/workflows/ci.yml)
+
 ## Joke Generator Workflow
 
 ```mermaid

@@ -9,12 +9,12 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="COMEDY_FACTORY_")
 
-    scan_news_model: str = "google:gemini-2.0-flash"
-    generate_subtext_model: str = "google:gemini-2.0-flash"
-    grade_subtext_model: str = "google:gemini-2.0-flash"
-    generate_joke_model: str = "google:gemini-2.0-flash"
-    grade_joke_model: str = "google:gemini-2.0-flash"
-    write_image_prompt_model: str = "google:gemini-2.0-flash"
+    scan_news_model: str = "google-cloud:gemini-3.5-flash"
+    generate_subtext_model: str = "google-cloud:gemini-3.5-flash"
+    grade_subtext_model: str = "google-cloud:gemini-3.5-flash"
+    generate_joke_model: str = "google-cloud:gemini-3.5-flash"
+    grade_joke_model: str = "google-cloud:gemini-3.5-flash"
+    write_image_prompt_model: str = "google-cloud:gemini-3.5-flash"
     prompts_dir: Path = Path(__file__).parent.parent / "prompts"
     max_grade_attempts: int = 3
 

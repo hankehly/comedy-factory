@@ -10,16 +10,16 @@ flowchart TD
     classDef llm fill:#dbeafe,stroke:#2563eb,color:#1e3a8a
     classDef system fill:#dcfce7,stroke:#16a34a,color:#14532d
 
-    s1(["Scan news for topics"]):::agent
+    s1(["Find topic"]):::agent
     s2(["Generate subtext"]):::llm
     s3{"Grade subtext"}:::llm
-    s4(["Generate Joke"]):::llm
-    s5{"Grade Joke"}:::llm
+    s4(["Generate joke"]):::llm
+    s5{"Grade joke"}:::llm
     s6(["Write image prompt"]):::llm
-    s7(["Generate image (no text)"]):::llm
-    s8[["Render caption on image"]]:::system
-    s9(["Evaluate joke holistically"]):::llm
-    s10[["Save asset bundle"]]:::system
+    s7(["Generate image"]):::llm
+    s8[["Render caption"]]:::system
+    s9(["Grade asset"]):::llm
+    s10[["Save asset"]]:::system
 
     s1 --> s2 --> s3
     s3 -- criteria met --> s4

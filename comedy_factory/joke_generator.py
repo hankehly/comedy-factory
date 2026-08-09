@@ -1,8 +1,8 @@
 """Joke generator workflow (see README.md for the flowchart).
 
-Step 1 — Scan news for topics: agent step that uses Gemini's native Google
-Search grounding to find real, current stories and returns them as plain
-factual one-sentence topics.
+Step 1 — Find topic: agent step that uses Gemini's native Google Search
+grounding to find a real, current news story and return it as a plain factual
+one-sentence topic with its source URL.
 
 Step 2 — Generate subtext: LLM step that turns a topic into a subtext — the
 writer's opinion, the idea the eventual joke communicates.
@@ -72,6 +72,18 @@ class Grade(BaseModel):
     )
 
 
+class Topic(BaseModel):
+    """A news topic — the raw material a joke is built from."""
+
+    text: str = Field(
+        description="A single factual sentence summarizing one real news story."
+    )
+    source_url: str | None = Field(
+        default=None,
+        description="URL of the news story the topic summarizes, when available.",
+    )
+
+
 class Subtext(BaseModel):
     """A subtext — the writer's opinion that a joke communicates."""
 
@@ -101,11 +113,11 @@ class Joke(BaseModel):
     )
 
 
-# Scanning news is a genuine agent step (search tool loop); the subtext steps
-# are single model calls made directly via model_request_sync.
-_scan_news_agent = Agent(
-    settings.scan_news_model,
-    name="scan_news",
+# Finding a topic is a genuine agent step (search tool loop); the other LLM
+# steps are single model calls made directly via model_request_sync.
+_find_topic_agent = Agent(
+    settings.find_topic_model,
+    name="find_topic",
     capabilities=[WebSearch()],
 )
 
@@ -153,19 +165,27 @@ _image_prompt_request_parameters = ModelRequestParameters(
 )
 
 
-def scan_news() -> str:
-    """Return a factual news topic suitable for joke writing."""
-    prompt = load_prompt("scan-news.md")
+def find_topic() -> Topic:
+    """Return a factual news topic suitable for joke writing, with its source
+    URL when the model provides one."""
+    prompt = load_prompt("find-topic.md")
 
-    result = _scan_news_agent.run_sync(prompt)
+    result = _find_topic_agent.run_sync(prompt)
 
-    # The prompt demands a bare one-line topic; strip any numbering/bullets or
-    # extra lines that slip through anyway.
-    for line in result.output.splitlines():
-        topic = re.sub(r"^\s*(?:[-*•]|\d+[.)])\s*", "", line).strip()
-        if topic:
-            return topic
-    raise RuntimeError("News scan returned no topic")
+    # The prompt demands the bare topic line followed by the source URL; strip
+    # any numbering/bullets or extra lines that slip through anyway.
+    lines = [
+        re.sub(r"^\s*(?:[-*•]|\d+[.)])\s*", "", line).strip()
+        for line in result.output.splitlines()
+    ]
+    text = next(
+        (line for line in lines if line and not line.startswith("http")), None
+    )
+    if text is None:
+        raise RuntimeError("News scan returned no topic")
+
+    url_match = re.search(r"https?://\S+", result.output)
+    return Topic(text=text, source_url=url_match.group() if url_match else None)
 
 
 def generate_subtext(
@@ -201,19 +221,21 @@ def generate_subtext(
 
 
 def generate_joke(
+    topic: str,
     subtext: str,
     history: list[ModelMessage] | None = None,
     feedback: str | None = None,
 ) -> tuple[Joke, list[ModelMessage]]:
-    """Return a joke communicating the subtext — along with the rationale
-    behind its construction — and the conversation history that produced it.
+    """Return a joke anchored to the news topic and communicating the subtext —
+    along with the rationale behind its construction — and the conversation
+    history that produced it.
 
     To request a rewrite after a failed grading, pass back the returned
     `history` along with the grader's `feedback`; the model then sees its
     previous attempts as prior turns of the conversation.
     """
     if history is None:
-        prompt = load_prompt("generate-joke.md", SUBTEXT=subtext)
+        prompt = load_prompt("generate-joke.md", TOPIC=topic, SUBTEXT=subtext)
         history = [ModelRequest.user_text_prompt(prompt)]
     if feedback:
         history.append(
@@ -359,9 +381,9 @@ def grade_subtext(topic: str, subtext: str) -> Grade:
     return Grade.model_validate_json(response_text(response))
 
 
-def grade_joke(subtext: str, joke: str) -> Grade:
+def grade_joke(topic: str, subtext: str, joke: str) -> Grade:
     """Evaluate a joke against the rules; a fail comes with feedback."""
-    prompt = load_prompt("evaluate-joke.md", SUBTEXT=subtext, JOKE=joke)
+    prompt = load_prompt("evaluate-joke.md", TOPIC=topic, SUBTEXT=subtext, JOKE=joke)
 
     response = model_request_sync(
         settings.grade_joke_model,
@@ -373,7 +395,7 @@ def grade_joke(subtext: str, joke: str) -> Grade:
 
 
 def grade_asset(
-    topic: str,
+    topic: Topic,
     subtext: Subtext,
     joke: Joke,
     captioned_image: bytes,
@@ -388,7 +410,7 @@ def grade_asset(
 
 
 def save_asset(
-    topic: str,
+    topic: Topic,
     subtext: Subtext,
     joke: Joke,
     image_prompt: ImagePrompt,
@@ -404,7 +426,7 @@ def save_asset(
 
     metadata = {
         "created_at": created_at.isoformat(),
-        "topic": topic,
+        "topic": topic.model_dump(),
         "subtext": subtext.model_dump(),
         "joke": joke.model_dump(),
         "image_prompt": image_prompt.model_dump(),
@@ -417,14 +439,15 @@ def save_asset(
 
 def main():
     """Execute the joke generator workflow."""
-    topic = scan_news()
-    logger.info(f"Topic: {topic}")
+    topic = find_topic()
+    logger.info(f"Topic: {topic.text}")
+    logger.info(f"Source: {topic.source_url}")
 
     history = None
     feedback = None
     for attempt in range(1, settings.max_grade_attempts + 1):
-        subtext, history = generate_subtext(topic, history, feedback)
-        grade = grade_subtext(topic, subtext.text)
+        subtext, history = generate_subtext(topic.text, history, feedback)
+        grade = grade_subtext(topic.text, subtext.text)
         if grade.passed:
             break
         feedback = grade.feedback
@@ -438,8 +461,8 @@ def main():
     history = None
     feedback = None
     for attempt in range(1, settings.max_grade_attempts + 1):
-        joke, history = generate_joke(subtext.text, history, feedback)
-        grade = grade_joke(subtext.text, joke.text)
+        joke, history = generate_joke(topic.text, subtext.text, history, feedback)
+        grade = grade_joke(topic.text, subtext.text, joke.text)
         if grade.passed:
             break
         feedback = grade.feedback

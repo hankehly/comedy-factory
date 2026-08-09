@@ -11,7 +11,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="COMEDY_FACTORY_")
 
-    scan_news_model: str = "google-cloud:gemini-3.5-flash"
+    find_topic_model: str = "google-cloud:gemini-3.5-flash"
     generate_subtext_model: str = "google-cloud:gemini-3.5-flash"
     grade_subtext_model: str = "google-cloud:gemini-3.5-flash"
     generate_joke_model: str = "google-cloud:gemini-3.5-flash"

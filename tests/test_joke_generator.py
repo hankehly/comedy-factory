@@ -26,7 +26,8 @@ from comedy_factory.joke_generator import (
     ImagePrompt,
     Joke,
     Subtext,
-    _scan_news_agent,
+    Topic,
+    _find_topic_agent,
     _wrap_caption,
     grade_asset,
     generate_image,
@@ -36,7 +37,7 @@ from comedy_factory.joke_generator import (
     grade_subtext,
     render_caption,
     save_asset,
-    scan_news,
+    find_topic,
     write_image_prompt,
 )
 from comedy_factory.settings import settings
@@ -94,11 +95,28 @@ def image_api_calls(monkeypatch):
     return calls
 
 
-def test_scan_news_returns_bare_topic():
+def test_find_topic_returns_bare_topic():
     canned = "* A fake topic.\n\nSome trailing explanation."
-    with _scan_news_agent.override(model=canned_model(canned), native_tools=[]):
-        topic = scan_news()
-    assert topic == "A fake topic."
+    with _find_topic_agent.override(model=canned_model(canned), native_tools=[]):
+        topic = find_topic()
+    assert topic.text == "A fake topic."
+    assert topic.source_url is None
+
+
+def test_find_topic_parses_source_url():
+    canned = "A fake topic.\nhttps://example.com/story"
+    with _find_topic_agent.override(model=canned_model(canned), native_tools=[]):
+        topic = find_topic()
+    assert topic.text == "A fake topic."
+    assert topic.source_url == "https://example.com/story"
+
+
+def test_find_topic_ignores_url_ordering():
+    canned = "https://example.com/story\nA fake topic."
+    with _find_topic_agent.override(model=canned_model(canned), native_tools=[]):
+        topic = find_topic()
+    assert topic.text == "A fake topic."
+    assert topic.source_url == "https://example.com/story"
 
 
 def test_generate_subtext(monkeypatch):
@@ -124,7 +142,7 @@ def test_generate_subtext_retry_extends_history(monkeypatch):
 def test_generate_joke(monkeypatch):
     canned = Joke(text="A fake joke.", rationale="Irony.").model_dump_json()
     monkeypatch.setattr(settings, "generate_joke_model", canned_model(canned))
-    joke, history = generate_joke("A fake subtext.")
+    joke, history = generate_joke("A fake topic.", "A fake subtext.")
     assert joke.text == "A fake joke."
     assert joke.rationale == "Irony."
     assert len(history) == 2
@@ -206,14 +224,14 @@ def test_grade_subtext_fail(monkeypatch):
 def test_grade_joke_fail(monkeypatch):
     canned = Grade(passed=False, feedback="* The funny part is not last.").model_dump_json()
     monkeypatch.setattr(settings, "grade_joke_model", canned_model(canned))
-    grade = grade_joke("A fake subtext.", "A fake joke.")
+    grade = grade_joke("A fake topic.", "A fake subtext.", "A fake joke.")
     assert not grade.passed
     assert grade.feedback == "* The funny part is not last."
 
 
 def test_grade_asset_is_a_passthrough():
     grade = grade_asset(
-        "Any topic.",
+        Topic(text="Any topic."),
         Subtext(text="Any subtext."),
         Joke(text="Any joke.", rationale="Any rationale."),
         b"any-image-bytes",
@@ -225,7 +243,7 @@ def test_save_asset(monkeypatch, tmp_path):
     monkeypatch.setattr(settings, "output_dir", tmp_path / "output")
 
     bundle_dir = save_asset(
-        topic="A fake topic.",
+        topic=Topic(text="A fake topic.", source_url="https://example.com/story"),
         subtext=Subtext(text="A fake subtext."),
         joke=Joke(text="A fake joke.", rationale="Irony."),
         image_prompt=ImagePrompt(text="A fake image prompt."),
@@ -236,7 +254,8 @@ def test_save_asset(monkeypatch, tmp_path):
     assert bundle_dir.parent == tmp_path / "output"
     assert (bundle_dir / "image.jpg").read_bytes() == FAKE_IMAGE_BYTES
     metadata = json.loads((bundle_dir / "metadata.json").read_text())
-    assert metadata["topic"] == "A fake topic."
+    assert metadata["topic"]["text"] == "A fake topic."
+    assert metadata["topic"]["source_url"] == "https://example.com/story"
     assert metadata["subtext"]["text"] == "A fake subtext."
     assert metadata["joke"]["text"] == "A fake joke."
     assert metadata["image_prompt"]["text"] == "A fake image prompt."
@@ -284,7 +303,7 @@ def _pipeline_model(messages: list, info: AgentInfo) -> ModelResponse:
 def test_main_smoke(monkeypatch, tmp_path, log_output):
     _set_all_step_models(monkeypatch, FunctionModel(_pipeline_model, profile=_PROFILE))
     monkeypatch.setattr(settings, "output_dir", tmp_path / "output")
-    with _scan_news_agent.override(model=canned_model("A fake topic."), native_tools=[]):
+    with _find_topic_agent.override(model=canned_model("A fake topic."), native_tools=[]):
         joke_generator.main()
 
     out = "".join(log_output)
@@ -331,7 +350,7 @@ def test_main_retries_failed_joke_grading(monkeypatch, tmp_path, log_output):
 
     _set_all_step_models(monkeypatch, FunctionModel(model, profile=_PROFILE))
     monkeypatch.setattr(settings, "output_dir", tmp_path / "output")
-    with _scan_news_agent.override(model=canned_model("A fake topic."), native_tools=[]):
+    with _find_topic_agent.override(model=canned_model("A fake topic."), native_tools=[]):
         joke_generator.main()
 
     out = "".join(log_output)

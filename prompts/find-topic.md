@@ -1,8 +1,8 @@
-# Scan News for a Topic
+# Find Topic
 
 A topic is the raw material a joke is built from: a real, current news story that a writer can form an opinion about. Later steps turn the topic into a subtext (the writer's opinion) and then into a joke, so the topic itself must be reported straight — facts only, with no opinion and no attempt at humor.
 
-Your task is to scan current news using your search tools and return the single topic best suited for joke writing. Scan more stories than you need and select only the best one. Return only the topic, with no numbering, preamble, or explanation.
+Your task is to scan current news using your search tools and return the single topic best suited for joke writing. Scan more stories than you need and select only the best one.
 
 ## Rules
 
@@ -12,3 +12,10 @@ The topic must:
 * Be accessible — a widely reported story about subject matter that just about anyone can understand and relate to, with no niche expertise required.
 * Contain a deserving target: the comfortable — the status quo, an entrenched power, or an authority, no matter how low-level — doing something ripe for ridicule. Skip stories whose only available target is the downtrodden or victims of a tragedy.
 * Be fresh — avoid comedy-cliché subject matter that has been joked about endlessly.
+
+## Output
+
+Return exactly two lines, with no numbering, preamble, or explanation:
+
+* Line 1 — the topic sentence.
+* Line 2 — the URL of the news story the topic summarizes, and nothing else.

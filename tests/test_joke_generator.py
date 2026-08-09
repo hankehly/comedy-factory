@@ -8,6 +8,9 @@ Model stubbing follows pydantic-ai's recommended seams:
   that attribute with a TestModel/FunctionModel instance.
 """
 
+import base64
+
+import pytest
 from pydantic_ai.messages import ModelResponse, TextPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.models.test import TestModel
@@ -16,14 +19,17 @@ from pydantic_ai.profiles import ModelProfile
 from comedy_factory import joke_generator
 from comedy_factory.joke_generator import (
     Grade,
+    ImagePrompt,
     Joke,
     Subtext,
     _scan_news_agent,
+    generate_image,
     generate_joke,
     generate_subtext,
     grade_joke,
     grade_subtext,
     scan_news,
+    write_image_prompt,
 )
 from comedy_factory.settings import settings
 
@@ -34,6 +40,33 @@ _PROFILE = ModelProfile(supports_json_schema_output=True)
 def canned_model(text: str) -> TestModel:
     """A model that always answers with `text`."""
     return TestModel(custom_output_text=text, profile=_PROFILE)
+
+
+FAKE_IMAGE_BYTES = b"fake-jpeg-bytes"
+
+
+@pytest.fixture
+def image_api_calls(monkeypatch):
+    """Stub the Cloudflare image API at the httpx level; records POST calls."""
+    calls = []
+    payload = {
+        "success": True,
+        "result": {"image": base64.b64encode(FAKE_IMAGE_BYTES).decode()},
+    }
+
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return payload
+
+    def fake_post(url, **kwargs):
+        calls.append((url, kwargs))
+        return FakeResponse()
+
+    monkeypatch.setattr(joke_generator.httpx, "post", fake_post)
+    return calls
 
 
 def test_scan_news_returns_bare_topic():
@@ -72,6 +105,27 @@ def test_generate_joke(monkeypatch):
     assert len(history) == 2
 
 
+def test_write_image_prompt(monkeypatch):
+    canned = ImagePrompt(text="A fake image prompt.").model_dump_json()
+    monkeypatch.setattr(settings, "model", canned_model(canned))
+    joke = Joke(text="A fake joke.", rationale="Irony.")
+    assert write_image_prompt(joke).text == "A fake image prompt."
+
+
+def test_generate_image(monkeypatch, image_api_calls):
+    monkeypatch.setattr(settings, "cloudflare_account_id", "test-account")
+    monkeypatch.setattr(settings, "cloudflare_api_token", "test-token")
+
+    image = generate_image(ImagePrompt(text="A fake image prompt."))
+
+    assert image == FAKE_IMAGE_BYTES
+    (url, kwargs), = image_api_calls
+    assert "test-account" in url
+    assert url.endswith(settings.image_model)
+    assert kwargs["headers"]["Authorization"] == "Bearer test-token"
+    assert kwargs["json"] == {"prompt": "A fake image prompt."}
+
+
 def test_grade_subtext_pass(monkeypatch):
     canned = Grade(passed=True).model_dump_json()
     monkeypatch.setattr(settings, "model", canned_model(canned))
@@ -106,13 +160,16 @@ def _pipeline_model(messages: list, info: AgentInfo) -> ModelResponse:
         text = Joke(text="A fake joke.", rationale="Irony.").model_dump_json()
     elif schema_name == "Subtext":
         text = Subtext(text="A fake subtext.").model_dump_json()
+    elif schema_name == "ImagePrompt":
+        text = ImagePrompt(text="A fake image prompt.").model_dump_json()
     else:
         raise AssertionError(f"Unexpected request schema: {schema_name}")
     return ModelResponse(parts=[TextPart(content=text)])
 
 
-def test_main_smoke(monkeypatch, capsys):
+def test_main_smoke(monkeypatch, capsys, tmp_path, image_api_calls):
     monkeypatch.setattr(settings, "model", FunctionModel(_pipeline_model, profile=_PROFILE))
+    monkeypatch.chdir(tmp_path)
     with _scan_news_agent.override(model=canned_model("A fake topic."), native_tools=[]):
         joke_generator.main()
 
@@ -121,9 +178,11 @@ def test_main_smoke(monkeypatch, capsys):
     assert "Subtext: A fake subtext." in out
     assert "Joke: A fake joke." in out
     assert "Rationale: Irony." in out
+    assert "Image prompt: A fake image prompt." in out
+    assert (tmp_path / "joke-image.jpg").read_bytes() == FAKE_IMAGE_BYTES
 
 
-def test_main_retries_failed_joke_grading(monkeypatch, capsys):
+def test_main_retries_failed_joke_grading(monkeypatch, capsys, tmp_path, image_api_calls):
     joke_grades = iter(
         [Grade(passed=False, feedback="* The funny part is not last."), Grade(passed=True)]
     )
@@ -139,11 +198,14 @@ def test_main_retries_failed_joke_grading(monkeypatch, capsys):
             text = Joke(text="A fake joke.", rationale="Irony.").model_dump_json()
         elif schema_name == "Subtext":
             text = Subtext(text="A fake subtext.").model_dump_json()
+        elif schema_name == "ImagePrompt":
+            text = ImagePrompt(text="A fake image prompt.").model_dump_json()
         else:
             raise AssertionError(f"Unexpected request schema: {schema_name}")
         return ModelResponse(parts=[TextPart(content=text)])
 
     monkeypatch.setattr(settings, "model", FunctionModel(model, profile=_PROFILE))
+    monkeypatch.chdir(tmp_path)
     with _scan_news_agent.override(model=canned_model("A fake topic."), native_tools=[]):
         joke_generator.main()
 

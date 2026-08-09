@@ -15,9 +15,20 @@ filter" (irony, character, shock, hyperbole) into a short joke.
 
 Step 5 — Grade joke: evaluation gate. If the joke breaks a rule, the workflow
 re-runs step 4 with the grader's feedback.
+
+Step 6 — Write image prompt: LLM step that writes a text-to-image prompt for a
+text-free image that plays the joke straight; the joke text is rendered onto
+the image later as a caption.
+
+Step 7 — Generate image: system-adjacent step that renders the image prompt
+with FLUX.1-schnell on Cloudflare Workers AI and returns the JPEG bytes.
 """
 
+import base64
 import re
+from pathlib import Path
+
+import httpx
 
 from pydantic import BaseModel, Field
 from pydantic_ai import Agent
@@ -90,6 +101,17 @@ _grade_request_parameters = ModelRequestParameters(
     ),
 )
 
+class ImagePrompt(BaseModel):
+    """A text-to-image prompt for the image that accompanies a joke."""
+
+    text: str = Field(
+        description=(
+            "The image prompt and nothing else — no preamble and no"
+            " explanation."
+        )
+    )
+
+
 _subtext_request_parameters = ModelRequestParameters(
     output_mode="native",
     output_object=OutputObjectDefinition(
@@ -103,6 +125,14 @@ _joke_request_parameters = ModelRequestParameters(
     output_object=OutputObjectDefinition(
         name=Joke.__name__,
         json_schema=Joke.model_json_schema(),
+    ),
+)
+
+_image_prompt_request_parameters = ModelRequestParameters(
+    output_mode="native",
+    output_object=OutputObjectDefinition(
+        name=ImagePrompt.__name__,
+        json_schema=ImagePrompt.model_json_schema(),
     ),
 )
 
@@ -186,6 +216,41 @@ def generate_joke(
     return Joke.model_validate_json(response_text(response)), history
 
 
+def write_image_prompt(joke: Joke) -> ImagePrompt:
+    """Return a text-to-image prompt for the image that accompanies the joke.
+
+    This step has no grading gate and no retry conversation — a single call.
+    """
+    prompt = load_prompt(
+        "write-image-prompt.md", JOKE=joke.text, RATIONALE=joke.rationale
+    )
+
+    response = model_request_sync(
+        settings.model,
+        [ModelRequest.user_text_prompt(prompt)],
+        model_request_parameters=_image_prompt_request_parameters,
+    )
+
+    return ImagePrompt.model_validate_json(response_text(response))
+
+
+def generate_image(image_prompt: ImagePrompt) -> bytes:
+    """Render the image prompt with Cloudflare Workers AI; returns JPEG bytes."""
+    response = httpx.post(
+        "https://api.cloudflare.com/client/v4/accounts/"
+        f"{settings.cloudflare_account_id}/ai/run/{settings.image_model}",
+        headers={"Authorization": f"Bearer {settings.cloudflare_api_token}"},
+        json={"prompt": image_prompt.text},
+        timeout=60,
+    )
+    response.raise_for_status()
+
+    payload = response.json()
+    if not payload.get("success"):
+        raise RuntimeError(f"Image generation failed: {payload.get('errors')}")
+    return base64.b64decode(payload["result"]["image"])
+
+
 def grade_subtext(topic: str, subtext: str) -> Grade:
     """Evaluate a subtext against the rules; a fail comes with feedback."""
     prompt = load_prompt("evaluate-subtext.md", TOPIC=topic, SUBTEXT=subtext)
@@ -247,6 +312,14 @@ def main():
         )
     print(f"Joke: {joke.text}")
     print(f"Rationale: {joke.rationale}")
+
+    image_prompt = write_image_prompt(joke)
+    print(f"Image prompt: {image_prompt.text}")
+
+    image = generate_image(image_prompt)
+    image_path = Path("joke-image.jpg")
+    image_path.write_bytes(image)
+    print(f"Image saved to {image_path}")
 
 
 if __name__ == "__main__":

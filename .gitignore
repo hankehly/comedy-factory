@@ -23,3 +23,6 @@ htmlcov/
 
 # Workflow output
 *.jpg
+
+# Local notes / scratch space — never committed
+scratch/

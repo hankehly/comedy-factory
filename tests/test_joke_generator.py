@@ -170,7 +170,7 @@ def test_generate_subtext_retry_extends_history(monkeypatch):
 def test_generate_joke(monkeypatch):
     canned = Joke(text="A fake joke.", rationale="Irony.").model_dump_json()
     monkeypatch.setattr(settings, "generate_joke_model", canned_model(canned))
-    joke, history = generate_joke("A fake topic.", "A fake subtext.")
+    joke, history = generate_joke("A fake subtext.")
     assert joke.text == "A fake joke."
     assert joke.rationale == "Irony."
     assert len(history) == 2
@@ -252,7 +252,7 @@ def test_grade_subtext_fail(monkeypatch):
 def test_grade_joke_fail(monkeypatch):
     canned = Grade(passed=False, feedback="* The funny part is not last.").model_dump_json()
     monkeypatch.setattr(settings, "grade_joke_model", canned_model(canned))
-    grade = grade_joke("A fake topic.", "A fake subtext.", "A fake joke.")
+    grade = grade_joke("A fake subtext.", "A fake joke.")
     assert not grade.passed
     assert grade.feedback == "* The funny part is not last."
 

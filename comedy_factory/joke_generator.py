@@ -245,21 +245,19 @@ def generate_subtext(
 
 
 def generate_joke(
-    topic: str,
     subtext: str,
     history: list[ModelMessage] | None = None,
     feedback: str | None = None,
 ) -> tuple[Joke, list[ModelMessage]]:
-    """Return a joke anchored to the news topic and communicating the subtext —
-    along with the rationale behind its construction — and the conversation
-    history that produced it.
+    """Return a joke communicating the subtext — along with the rationale
+    behind its construction — and the conversation history that produced it.
 
     To request a rewrite after a failed grading, pass back the returned
     `history` along with the grader's `feedback`; the model then sees its
     previous attempts as prior turns of the conversation.
     """
     if history is None:
-        prompt = load_prompt("generate-joke.md", TOPIC=topic, SUBTEXT=subtext)
+        prompt = load_prompt("generate-joke.md", SUBTEXT=subtext)
         history = [ModelRequest.user_text_prompt(prompt)]
     if feedback:
         history.append(
@@ -405,9 +403,9 @@ def grade_subtext(topic: str, subtext: str) -> Grade:
     return Grade.model_validate_json(response_text(response))
 
 
-def grade_joke(topic: str, subtext: str, joke: str) -> Grade:
+def grade_joke(subtext: str, joke: str) -> Grade:
     """Evaluate a joke against the rules; a fail comes with feedback."""
-    prompt = load_prompt("evaluate-joke.md", TOPIC=topic, SUBTEXT=subtext, JOKE=joke)
+    prompt = load_prompt("evaluate-joke.md", SUBTEXT=subtext, JOKE=joke)
 
     response = model_request_sync(
         settings.grade_joke_model,
@@ -485,8 +483,8 @@ def main():
     history = None
     feedback = None
     for attempt in range(1, settings.max_grade_attempts + 1):
-        joke, history = generate_joke(topic.text, subtext.text, history, feedback)
-        grade = grade_joke(topic.text, subtext.text, joke.text)
+        joke, history = generate_joke(subtext.text, history, feedback)
+        grade = grade_joke(subtext.text, joke.text)
         if grade.passed:
             break
         feedback = grade.feedback

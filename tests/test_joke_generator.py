@@ -9,8 +9,10 @@ Model stubbing follows pydantic-ai's recommended seams:
 """
 
 import base64
+import io
 
 import pytest
+from PIL import Image, ImageFont
 from pydantic_ai.messages import ModelResponse, TextPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.models.test import TestModel
@@ -23,11 +25,13 @@ from comedy_factory.joke_generator import (
     Joke,
     Subtext,
     _scan_news_agent,
+    _wrap_caption,
     generate_image,
     generate_joke,
     generate_subtext,
     grade_joke,
     grade_subtext,
+    render_caption,
     scan_news,
     write_image_prompt,
 )
@@ -42,7 +46,14 @@ def canned_model(text: str) -> TestModel:
     return TestModel(custom_output_text=text, profile=_PROFILE)
 
 
-FAKE_IMAGE_BYTES = b"fake-jpeg-bytes"
+def _tiny_jpeg(width: int = 64, height: int = 48) -> bytes:
+    """A real (gray) JPEG so the caption step can decode it."""
+    buffer = io.BytesIO()
+    Image.new("RGB", (width, height), "gray").save(buffer, format="JPEG")
+    return buffer.getvalue()
+
+
+FAKE_IMAGE_BYTES = _tiny_jpeg()
 
 
 @pytest.fixture
@@ -126,6 +137,23 @@ def test_generate_image(monkeypatch, image_api_calls):
     assert kwargs["json"] == {"prompt": "A fake image prompt."}
 
 
+def test_render_caption_adds_bar_below_image():
+    captioned = render_caption(FAKE_IMAGE_BYTES, "A fake joke.")
+    image = Image.open(io.BytesIO(captioned))
+    assert image.format == "JPEG"
+    assert image.width == 64  # width unchanged
+    assert image.height > 48  # caption bar appended below
+
+
+def test_wrap_caption_wraps_to_width():
+    font = ImageFont.load_default(size=24)
+    caption = "one two three four five six seven eight"
+    lines = _wrap_caption(caption, font, 100)
+    assert len(lines) > 1
+    assert all(font.getlength(line) <= 100 for line in lines)
+    assert " ".join(lines) == caption  # no words lost or reordered
+
+
 def test_grade_subtext_pass(monkeypatch):
     canned = Grade(passed=True).model_dump_json()
     monkeypatch.setattr(settings, "model", canned_model(canned))
@@ -179,7 +207,11 @@ def test_main_smoke(monkeypatch, capsys, tmp_path, image_api_calls):
     assert "Joke: A fake joke." in out
     assert "Rationale: Irony." in out
     assert "Image prompt: A fake image prompt." in out
-    assert (tmp_path / "joke-image.jpg").read_bytes() == FAKE_IMAGE_BYTES
+    # The saved file is the generated image plus the rendered caption bar.
+    saved = Image.open(tmp_path / "joke-image.jpg")
+    assert saved.format == "JPEG"
+    assert saved.width == 64
+    assert saved.height > 48
 
 
 def test_main_retries_failed_joke_grading(monkeypatch, capsys, tmp_path, image_api_calls):

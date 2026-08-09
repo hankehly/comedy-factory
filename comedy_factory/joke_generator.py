@@ -22,13 +22,18 @@ the image later as a caption.
 
 Step 7 — Generate image: system-adjacent step that renders the image prompt
 with FLUX.1-schnell on Cloudflare Workers AI and returns the JPEG bytes.
+
+Step 8 — Render caption: system step that word-wraps the joke text into a
+white caption bar beneath the image and returns the combined JPEG bytes.
 """
 
 import base64
+import io
 import re
 from pathlib import Path
 
 import httpx
+from PIL import Image, ImageDraw, ImageFont
 
 from pydantic import BaseModel, Field
 from pydantic_ai import Agent
@@ -251,6 +256,68 @@ def generate_image(image_prompt: ImagePrompt) -> bytes:
     return base64.b64decode(payload["result"]["image"])
 
 
+def _wrap_caption(
+    caption: str, font: ImageFont.FreeTypeFont, max_width: int
+) -> list[str]:
+    """Greedily wrap the caption into lines at most `max_width` pixels wide.
+
+    A single word wider than `max_width` gets its own (overflowing) line.
+    """
+    lines: list[str] = []
+    line = ""
+    for word in caption.split():
+        candidate = f"{line} {word}".strip()
+        if line and font.getlength(candidate) > max_width:
+            lines.append(line)
+            line = word
+        else:
+            line = candidate
+    if line:
+        lines.append(line)
+    return lines
+
+
+def render_caption(image: bytes, caption: str) -> bytes:
+    """Return the image extended with a white caption bar showing the joke."""
+    base = Image.open(io.BytesIO(image)).convert("RGB")
+
+    # Scale typography with image width so captions look the same at any
+    # resolution. load_default(size=...) uses Pillow's embedded vector font,
+    # so no font file needs to ship with the project.
+    font_size = max(16, base.width // 20)
+    padding = font_size
+    spacing = font_size // 3
+    font = ImageFont.load_default(size=font_size)
+
+    lines = _wrap_caption(caption, font, base.width - 2 * padding)
+    text = "\n".join(lines)
+
+    draw = ImageDraw.Draw(base)
+    bbox = draw.multiline_textbbox((0, 0), text, font=font, spacing=spacing)
+
+    canvas = Image.new(
+        "RGB",
+        (base.width, base.height + (bbox[3] - bbox[1]) + 2 * padding),
+        "white",
+    )
+    canvas.paste(base, (0, 0))
+    ImageDraw.Draw(canvas).multiline_text(
+        (
+            (base.width - (bbox[2] - bbox[0])) // 2 - bbox[0],
+            base.height + padding - bbox[1],
+        ),
+        text,
+        font=font,
+        fill="black",
+        spacing=spacing,
+        align="center",
+    )
+
+    buffer = io.BytesIO()
+    canvas.save(buffer, format="JPEG", quality=90)
+    return buffer.getvalue()
+
+
 def grade_subtext(topic: str, subtext: str) -> Grade:
     """Evaluate a subtext against the rules; a fail comes with feedback."""
     prompt = load_prompt("evaluate-subtext.md", TOPIC=topic, SUBTEXT=subtext)
@@ -317,8 +384,9 @@ def main():
     print(f"Image prompt: {image_prompt.text}")
 
     image = generate_image(image_prompt)
+    captioned = render_caption(image, joke.text)
     image_path = Path("joke-image.jpg")
-    image_path.write_bytes(image)
+    image_path.write_bytes(captioned)
     print(f"Image saved to {image_path}")
 
 

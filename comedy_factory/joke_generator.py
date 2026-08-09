@@ -180,7 +180,7 @@ def generate_subtext(
         )
 
     response = model_request_sync(
-        settings.model,
+        settings.generate_subtext_model,
         history,
         model_request_parameters=_subtext_request_parameters,
     )
@@ -212,7 +212,7 @@ def generate_joke(
         )
 
     response = model_request_sync(
-        settings.model,
+        settings.generate_joke_model,
         history,
         model_request_parameters=_joke_request_parameters,
     )
@@ -231,7 +231,7 @@ def write_image_prompt(joke: Joke) -> ImagePrompt:
     )
 
     response = model_request_sync(
-        settings.model,
+        settings.write_image_prompt_model,
         [ModelRequest.user_text_prompt(prompt)],
         model_request_parameters=_image_prompt_request_parameters,
     )
@@ -323,7 +323,7 @@ def grade_subtext(topic: str, subtext: str) -> Grade:
     prompt = load_prompt("evaluate-subtext.md", TOPIC=topic, SUBTEXT=subtext)
 
     response = model_request_sync(
-        settings.model,
+        settings.grade_subtext_model,
         [ModelRequest.user_text_prompt(prompt)],
         model_request_parameters=_grade_request_parameters,
     )
@@ -336,7 +336,7 @@ def grade_joke(subtext: str, joke: str) -> Grade:
     prompt = load_prompt("evaluate-joke.md", SUBTEXT=subtext, JOKE=joke)
 
     response = model_request_sync(
-        settings.model,
+        settings.grade_joke_model,
         [ModelRequest.user_text_prompt(prompt)],
         model_request_parameters=_grade_request_parameters,
     )

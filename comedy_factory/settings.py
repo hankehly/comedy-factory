@@ -16,6 +16,7 @@ class Settings(BaseSettings):
     grade_joke_model: str = "google-cloud:gemini-3.5-flash"
     write_image_prompt_model: str = "google-cloud:gemini-3.5-flash"
     prompts_dir: Path = Path(__file__).parent.parent / "prompts"
+    output_dir: Path = Path(__file__).parent.parent / "output"
     max_grade_attempts: int = 3
 
     # Cloudflare Workers AI, used for image generation. The credential env vars

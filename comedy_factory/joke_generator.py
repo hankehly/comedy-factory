@@ -25,11 +25,20 @@ with FLUX.1-schnell on Cloudflare Workers AI and returns the JPEG bytes.
 
 Step 8 — Render caption: system step that word-wraps the joke text into a
 white caption bar beneath the image and returns the combined JPEG bytes.
+
+Step 9 — Evaluate joke holistically: evaluation of the finished asset as a
+whole. Placeholder for now — the criteria are undecided, so everything passes;
+the verdict is recorded in the asset bundle rather than blocking it.
+
+Step 10 — Save asset bundle: system step that writes the run's artifacts
+(captioned image plus metadata) to a timestamped output directory.
 """
 
 import base64
 import io
+import json
 import re
+from datetime import datetime
 from pathlib import Path
 
 import httpx
@@ -344,6 +353,49 @@ def grade_joke(subtext: str, joke: str) -> Grade:
     return Grade.model_validate_json(response_text(response))
 
 
+def grade_asset(
+    topic: str,
+    subtext: Subtext,
+    joke: Joke,
+    captioned_image: bytes,
+) -> Grade:
+    """Evaluate the finished joke asset as a whole.
+
+    Placeholder: the evaluation criteria are not yet decided, so everything
+    passes. The signature already receives the full asset so criteria can be
+    added later without rewiring the pipeline.
+    """
+    return Grade(passed=True)
+
+
+def save_asset(
+    topic: str,
+    subtext: Subtext,
+    joke: Joke,
+    image_prompt: ImagePrompt,
+    captioned_image: bytes,
+    evaluation: Grade,
+) -> Path:
+    """Write the run's artifacts to a timestamped directory; returns its path."""
+    created_at = datetime.now()
+    bundle_dir = settings.output_dir / created_at.strftime("%Y%m%d-%H%M%S")
+    bundle_dir.mkdir(parents=True, exist_ok=True)
+
+    (bundle_dir / "image.jpg").write_bytes(captioned_image)
+
+    metadata = {
+        "created_at": created_at.isoformat(),
+        "topic": topic,
+        "subtext": subtext.model_dump(),
+        "joke": joke.model_dump(),
+        "image_prompt": image_prompt.model_dump(),
+        "evaluation": evaluation.model_dump(),
+    }
+    (bundle_dir / "metadata.json").write_text(json.dumps(metadata, indent=2))
+
+    return bundle_dir
+
+
 def main():
     """Execute the joke generator workflow."""
     topic = scan_news()
@@ -385,9 +437,12 @@ def main():
 
     image = generate_image(image_prompt)
     captioned = render_caption(image, joke.text)
-    image_path = Path("joke-image.jpg")
-    image_path.write_bytes(captioned)
-    print(f"Image saved to {image_path}")
+
+    evaluation = grade_asset(topic, subtext, joke, captioned)
+    bundle_dir = save_asset(
+        topic, subtext, joke, image_prompt, captioned, evaluation
+    )
+    print(f"Asset bundle saved to {bundle_dir}")
 
 
 if __name__ == "__main__":

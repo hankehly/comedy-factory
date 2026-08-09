@@ -22,6 +22,7 @@ __pycache__/
 htmlcov/
 
 # Workflow output
+output/
 *.jpg
 
 # Local notes / scratch space — never committed

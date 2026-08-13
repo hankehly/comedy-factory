@@ -6,9 +6,10 @@
 
 ```mermaid
 flowchart TD
-    classDef agent fill:#f3e8ff,stroke:#9333ea,color:#581c87
+    classDef agent fill:#fce7f3,stroke:#db2777,color:#831843
     classDef llm fill:#dbeafe,stroke:#2563eb,color:#1e3a8a
     classDef system fill:#dcfce7,stroke:#16a34a,color:#14532d
+    classDef human fill:#fef3c7,stroke:#d97706,color:#78350f
 
     s1(["Find topic"]):::agent
     s2(["Generate subtext"]):::llm
@@ -21,6 +22,7 @@ flowchart TD
     s9(["Describe image"]):::llm
     s10(["Grade asset"]):::llm
     s11[["Save asset"]]:::system
+    s12[\"Recaption joke"/]:::human
 
     s1 --> s2 --> s3
     s3 -- criteria met --> s4
@@ -29,9 +31,10 @@ flowchart TD
     s5 -- criteria met --> s6
     s5 -. "not met: re-run with feedback" .-> s4
     s6 --> s7 --> s8 --> s9 --> s10 --> s11
+    s11 -. "optional: edit the caption text" .-> s12
 ```
 
-Legend: purple nodes are **Agent** steps; blue nodes are **Augmented LLM** steps (diamond = evaluation gate); green nodes are **System** steps. Dotted edges are feedback loops.
+Legend: pink nodes are **Agent** steps; blue nodes are **Augmented LLM** steps (diamond = evaluation gate); green nodes are **System** steps; amber nodes are **Human** steps. Dotted edges are feedback loops or optional steps.
 
 ## Example output
 

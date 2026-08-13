@@ -24,11 +24,13 @@ from comedy_factory import joke_generator, recaption
 from comedy_factory.captioning import _wrap_caption, render_caption
 from comedy_factory.joke_generator import (
     Grade,
+    ImageDescription,
     ImagePrompt,
     Joke,
     Subtext,
     Topic,
     _find_topic_agent,
+    describe_image,
     grade_asset,
     generate_image,
     generate_joke,
@@ -40,6 +42,7 @@ from comedy_factory.joke_generator import (
     write_image_prompt,
 )
 from comedy_factory.settings import settings
+from comedy_factory.utils import compose_alt_text, image_media_type
 
 # Grading uses output_mode="native" and image generation uses image output;
 # TestModel/FunctionModel default profiles reject both.
@@ -215,6 +218,60 @@ def test_generate_image_google(monkeypatch):
     assert image == FAKE_IMAGE_BYTES
 
 
+def test_describe_image_sends_image_to_model(monkeypatch):
+    contents = []
+
+    def model(messages: list, info: AgentInfo) -> ModelResponse:
+        contents.append(messages[0].parts[0].content)
+        text = ImageDescription(text="A gray rectangle.").model_dump_json()
+        return ModelResponse(parts=[TextPart(content=text)])
+
+    monkeypatch.setattr(
+        settings, "describe_image_model", FunctionModel(model, profile=_PROFILE)
+    )
+
+    description = describe_image(FAKE_IMAGE_BYTES)
+
+    assert description.text == "A gray rectangle."
+    [(prompt, image)] = contents
+    assert "# Describe Image" in prompt
+    assert image.data == FAKE_IMAGE_BYTES
+    assert image.media_type == "image/jpeg"
+
+
+def test_describe_image_detects_png(monkeypatch):
+    contents = []
+
+    def model(messages: list, info: AgentInfo) -> ModelResponse:
+        contents.append(messages[0].parts[0].content)
+        text = ImageDescription(text="A gray rectangle.").model_dump_json()
+        return ModelResponse(parts=[TextPart(content=text)])
+
+    monkeypatch.setattr(
+        settings, "describe_image_model", FunctionModel(model, profile=_PROFILE)
+    )
+
+    buffer = io.BytesIO()
+    Image.new("RGB", (64, 48), "gray").save(buffer, format="PNG")
+    describe_image(buffer.getvalue())
+
+    [(_, image)] = contents
+    assert image.media_type == "image/png"
+
+
+def test_image_media_type_handles_any_pillow_format():
+    buffer = io.BytesIO()
+    Image.new("RGB", (4, 4), "gray").save(buffer, format="WEBP")
+    assert image_media_type(buffer.getvalue()) == "image/webp"
+
+
+def test_compose_alt_text():
+    assert (
+        compose_alt_text("Aerial photo of a dam.", "A fake joke.")
+        == 'Aerial photo of a dam. Caption reads: "A fake joke."'
+    )
+
+
 def test_render_caption_adds_bar_below_image():
     captioned = render_caption(FAKE_IMAGE_BYTES, "A fake joke.")
     image = Image.open(io.BytesIO(captioned))
@@ -256,6 +313,31 @@ def test_recaption_rewrites_from_original_and_keeps_versions(tmp_path, capsys):
         assert image.height > 48  # caption bar appended below the 48px original
 
 
+def test_recaption_recomposes_alt_text_from_metadata(tmp_path, capsys):
+    bundle_dir = tmp_path / "20260101-000000"
+    bundle_dir.mkdir()
+    (bundle_dir / "image-original.jpg").write_bytes(FAKE_IMAGE_BYTES)
+    (bundle_dir / "metadata.json").write_text(
+        json.dumps({"image_description": {"text": "A gray rectangle."}})
+    )
+
+    recaption.main([str(bundle_dir), "A new caption."])
+
+    out = capsys.readouterr().out
+    assert 'Alt text: A gray rectangle. Caption reads: "A new caption."' in out
+
+
+def test_recaption_skips_alt_text_without_description(tmp_path, capsys):
+    bundle_dir = tmp_path / "20260101-000000"
+    bundle_dir.mkdir()
+    (bundle_dir / "image-original.jpg").write_bytes(FAKE_IMAGE_BYTES)
+    (bundle_dir / "metadata.json").write_text(json.dumps({"topic": "An old story."}))
+
+    recaption.main([str(bundle_dir), "A new caption."])
+
+    assert "Alt text:" not in capsys.readouterr().out
+
+
 def test_recaption_requires_original_image(tmp_path):
     with pytest.raises(SystemExit):
         recaption.main([str(tmp_path), "A caption."])
@@ -291,6 +373,7 @@ def test_grade_asset_is_a_passthrough():
         Subtext(text="Any subtext."),
         Joke(text="Any joke.", rationale="Any rationale."),
         b"any-image-bytes",
+        ImageDescription(text="Any description."),
     )
     assert grade.passed
 
@@ -305,6 +388,7 @@ def test_save_asset(monkeypatch, tmp_path):
         image_prompt=ImagePrompt(text="A fake image prompt."),
         image=b"original-bytes",
         captioned_image=FAKE_IMAGE_BYTES,
+        image_description=ImageDescription(text="A gray rectangle."),
         evaluation=Grade(passed=True),
     )
 
@@ -317,6 +401,8 @@ def test_save_asset(monkeypatch, tmp_path):
     assert metadata["subtext"]["text"] == "A fake subtext."
     assert metadata["joke"]["text"] == "A fake joke."
     assert metadata["image_prompt"]["text"] == "A fake image prompt."
+    assert metadata["image_description"]["text"] == "A gray rectangle."
+    assert metadata["alt_text"] == 'A gray rectangle. Caption reads: "A fake joke."'
     assert metadata["evaluation"]["passed"] is True
     assert "created_at" in metadata
 
@@ -329,6 +415,7 @@ def _set_all_step_models(monkeypatch, model):
         "generate_joke_model",
         "grade_joke_model",
         "write_image_prompt_model",
+        "describe_image_model",
         "google_image_model",
     ):
         monkeypatch.setattr(settings, name, model)
@@ -353,6 +440,8 @@ def _pipeline_model(messages: list, info: AgentInfo) -> ModelResponse:
         text = Subtext(text="A fake subtext.").model_dump_json()
     elif schema_name == "ImagePrompt":
         text = ImagePrompt(text="A fake image prompt.").model_dump_json()
+    elif schema_name == "ImageDescription":
+        text = ImageDescription(text="A gray rectangle.").model_dump_json()
     else:
         raise AssertionError(f"Unexpected request schema: {schema_name}")
     return ModelResponse(parts=[TextPart(content=text)])
@@ -370,6 +459,7 @@ def test_main_smoke(monkeypatch, tmp_path, log_output):
     assert "Joke: A fake joke." in out
     assert "Rationale: Irony." in out
     assert "Image prompt: A fake image prompt." in out
+    assert 'Alt text: A gray rectangle. Caption reads: "A fake joke."' in out
     assert "Asset bundle saved to" in out
 
     [bundle_dir] = list((tmp_path / "output").iterdir())
@@ -381,6 +471,7 @@ def test_main_smoke(monkeypatch, tmp_path, log_output):
     assert saved.height > 48
     metadata = json.loads((bundle_dir / "metadata.json").read_text())
     assert metadata["joke"]["text"] == "A fake joke."
+    assert metadata["alt_text"] == 'A gray rectangle. Caption reads: "A fake joke."'
 
 
 def test_main_retries_failed_joke_grading(monkeypatch, tmp_path, log_output):
@@ -403,6 +494,8 @@ def test_main_retries_failed_joke_grading(monkeypatch, tmp_path, log_output):
             text = Subtext(text="A fake subtext.").model_dump_json()
         elif schema_name == "ImagePrompt":
             text = ImagePrompt(text="A fake image prompt.").model_dump_json()
+        elif schema_name == "ImageDescription":
+            text = ImageDescription(text="A gray rectangle.").model_dump_json()
         else:
             raise AssertionError(f"Unexpected request schema: {schema_name}")
         return ModelResponse(parts=[TextPart(content=text)])

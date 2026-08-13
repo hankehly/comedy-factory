@@ -5,13 +5,18 @@ writes it to a datetime-stamped `image-captioned-<YYYYmmdd-HHMMSS>.jpg` —
 later stamps are newer, and `image-captioned.jpg` is the pipeline's first
 version. Nothing is modified or overwritten, so this can be re-run on the
 same bundle any number of times and every caption version is retained.
+
+When the bundle's metadata records an image description, the alt text
+recomposed for the new caption is printed as well — no vision call needed.
 """
 
 import argparse
+import json
 from datetime import datetime
 from pathlib import Path
 
 from comedy_factory.captioning import render_caption
+from comedy_factory.utils import compose_alt_text
 
 
 def main(argv: list[str] | None = None):
@@ -40,6 +45,12 @@ def main(argv: list[str] | None = None):
 
     captioned_path.write_bytes(render_caption(original_path.read_bytes(), args.caption))
     print(f"Wrote {captioned_path}")
+
+    metadata_path = args.bundle_dir / "metadata.json"
+    if metadata_path.is_file():
+        description = json.loads(metadata_path.read_text()).get("image_description")
+        if description and description.get("text"):
+            print(f"Alt text: {compose_alt_text(description['text'], args.caption)}")
 
 
 if __name__ == "__main__":

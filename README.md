@@ -18,8 +18,9 @@ flowchart TD
     s6(["Write image prompt"]):::llm
     s7(["Generate image"]):::llm
     s8[["Render caption"]]:::system
-    s9(["Grade asset"]):::llm
-    s10[["Save asset"]]:::system
+    s9(["Describe image"]):::llm
+    s10(["Grade asset"]):::llm
+    s11[["Save asset"]]:::system
 
     s1 --> s2 --> s3
     s3 -- criteria met --> s4
@@ -27,7 +28,7 @@ flowchart TD
     s4 --> s5
     s5 -- criteria met --> s6
     s5 -. "not met: re-run with feedback" .-> s4
-    s6 --> s7 --> s8 --> s9 --> s10
+    s6 --> s7 --> s8 --> s9 --> s10 --> s11
 ```
 
 Legend: purple nodes are **Agent** steps; blue nodes are **Augmented LLM** steps (diamond = evaluation gate); green nodes are **System** steps. Dotted edges are feedback loops.
@@ -39,8 +40,3 @@ Legend: purple nodes are **Agent** steps; blue nodes are **Augmented LLM** steps
 <img src="docs/image-captioned-20260809-213744.jpg" alt="Example captioned joke image: a luxury car dashboard dispensing a silk pocket square" width="500">
 
 <img src="docs/image-captioned-20260809-213438.jpg" alt="Example captioned joke image: a collapsed dam rebranded as the state's newest public lake" width="500">
-
-
-Other considerations:
-* Alter image/font style (e.g., line sketch, realistic, anime, etc.)
-* Include a "post to social" step (human)

@@ -27,11 +27,16 @@ AI — and returns the image bytes.
 Step 8 — Render caption: system step that word-wraps the joke text into a
 white caption bar beneath the image and returns the combined JPEG bytes.
 
-Step 9 — Evaluate joke holistically: evaluation of the finished asset as a
+Step 9 — Describe image: vision LLM step that writes a factual visual
+description of the generated (uncaptioned) image. The posting alt text is
+this description with the caption sentence templated on, so a recaption can
+rebuild the alt text without another vision call.
+
+Step 10 — Evaluate joke holistically: evaluation of the finished asset as a
 whole. Placeholder for now — the criteria are undecided, so everything passes;
 the verdict is recorded in the asset bundle rather than blocking it.
 
-Step 10 — Save asset: system step that writes the run's artifacts (original
+Step 11 — Save asset: system step that writes the run's artifacts (original
 image, captioned image, and metadata) to a timestamped output directory.
 """
 
@@ -48,14 +53,24 @@ from pydantic import BaseModel, Field
 from pydantic_ai import Agent
 from pydantic_ai.capabilities import WebSearch
 from pydantic_ai.direct import model_request_sync
-from pydantic_ai.messages import ModelMessage, ModelRequest
+from pydantic_ai.messages import (
+    BinaryImage,
+    ModelMessage,
+    ModelRequest,
+    UserPromptPart,
+)
 from pydantic_ai.models import ModelRequestParameters
 from pydantic_ai.output import OutputObjectDefinition
 
 from comedy_factory.captioning import render_caption
 from comedy_factory.prompts import load_prompt
 from comedy_factory.settings import settings
-from comedy_factory.utils import response_image, response_text
+from comedy_factory.utils import (
+    compose_alt_text,
+    image_media_type,
+    response_image,
+    response_text,
+)
 
 
 class Grade(BaseModel):
@@ -139,6 +154,18 @@ class ImagePrompt(BaseModel):
     )
 
 
+class ImageDescription(BaseModel):
+    """A factual visual description of the generated image — the part of the
+    posting alt text that precedes the templated caption sentence."""
+
+    text: str = Field(
+        description=(
+            "The visual description and nothing else — no preamble, no"
+            " explanation, no surrounding quotation marks."
+        )
+    )
+
+
 _subtext_request_parameters = ModelRequestParameters(
     output_mode="native",
     output_object=OutputObjectDefinition(
@@ -160,6 +187,14 @@ _image_prompt_request_parameters = ModelRequestParameters(
     output_object=OutputObjectDefinition(
         name=ImagePrompt.__name__,
         json_schema=ImagePrompt.model_json_schema(),
+    ),
+)
+
+_image_description_request_parameters = ModelRequestParameters(
+    output_mode="native",
+    output_object=OutputObjectDefinition(
+        name=ImageDescription.__name__,
+        json_schema=ImageDescription.model_json_schema(),
     ),
 )
 
@@ -327,6 +362,37 @@ def _generate_image_cloudflare(image_prompt: ImagePrompt) -> bytes:
     return base64.b64decode(payload["result"]["image"])
 
 
+def describe_image(image: bytes) -> ImageDescription:
+    """Return a factual visual description of the generated image.
+
+    The description covers only what is visible in the image — the caption
+    sentence of the alt text is templated on by `compose_alt_text`, never read
+    back out of the pixels.
+    """
+    prompt = load_prompt("describe-image.md")
+
+    response = model_request_sync(
+        settings.describe_image_model,
+        [
+            ModelRequest(
+                parts=[
+                    UserPromptPart(
+                        content=[
+                            prompt,
+                            BinaryImage(
+                                data=image, media_type=image_media_type(image)
+                            ),
+                        ]
+                    )
+                ]
+            )
+        ],
+        model_request_parameters=_image_description_request_parameters,
+    )
+
+    return ImageDescription.model_validate_json(response_text(response))
+
+
 def grade_subtext(topic: str, subtext: str) -> Grade:
     """Evaluate a subtext against the rules; a fail comes with feedback."""
     prompt = load_prompt("evaluate-subtext.md", TOPIC=topic, SUBTEXT=subtext)
@@ -358,6 +424,7 @@ def grade_asset(
     subtext: Subtext,
     joke: Joke,
     captioned_image: bytes,
+    image_description: ImageDescription,
 ) -> Grade:
     """Evaluate the finished joke asset as a whole.
 
@@ -375,6 +442,7 @@ def save_asset(
     image_prompt: ImagePrompt,
     image: bytes,
     captioned_image: bytes,
+    image_description: ImageDescription,
     evaluation: Grade,
 ) -> Path:
     """Write the run's artifacts to a timestamped directory; returns its path."""
@@ -391,6 +459,8 @@ def save_asset(
         "subtext": subtext.model_dump(),
         "joke": joke.model_dump(),
         "image_prompt": image_prompt.model_dump(),
+        "image_description": image_description.model_dump(),
+        "alt_text": compose_alt_text(image_description.text, joke.text),
         "evaluation": evaluation.model_dump(),
     }
     (bundle_dir / "metadata.json").write_text(json.dumps(metadata, indent=2))
@@ -441,9 +511,19 @@ def main():
     image = generate_image(image_prompt)
     captioned = render_caption(image, joke.text)
 
-    evaluation = grade_asset(topic, subtext, joke, captioned)
+    image_description = describe_image(image)
+    logger.info(f"Alt text: {compose_alt_text(image_description.text, joke.text)}")
+
+    evaluation = grade_asset(topic, subtext, joke, captioned, image_description)
     bundle_dir = save_asset(
-        topic, subtext, joke, image_prompt, image, captioned, evaluation
+        topic,
+        subtext,
+        joke,
+        image_prompt,
+        image,
+        captioned,
+        image_description,
+        evaluation,
     )
     logger.info(f"Asset bundle saved to {bundle_dir}")
 

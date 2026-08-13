@@ -16,13 +16,14 @@ flowchart TD
     s3{"Grade subtext"}:::llm
     s4(["Generate joke"]):::llm
     s5{"Grade joke"}:::llm
-    s6(["Write image prompt"]):::llm
-    s7(["Generate image"]):::llm
-    s8[["Render caption"]]:::system
-    s9(["Describe image"]):::llm
-    s10(["Grade asset"]):::llm
-    s11[["Save asset"]]:::system
-    s12[\"Recaption joke"/]:::human
+    s6(["Rephrase joke"]):::llm
+    s7(["Write image prompt"]):::llm
+    s8(["Generate image"]):::llm
+    s9[["Render caption"]]:::system
+    s10(["Describe image"]):::llm
+    s11(["Grade asset"]):::llm
+    s12[["Save asset"]]:::system
+    s13[\"Recaption joke"/]:::human
 
     s1 --> s2 --> s3
     s3 -- criteria met --> s4
@@ -30,8 +31,8 @@ flowchart TD
     s4 --> s5
     s5 -- criteria met --> s6
     s5 -. "not met: re-run with feedback" .-> s4
-    s6 --> s7 --> s8 --> s9 --> s10 --> s11
-    s11 -. "optional: edit the caption text" .-> s12
+    s6 --> s7 --> s8 --> s9 --> s10 --> s11 --> s12
+    s12 -. "optional: edit the caption text" .-> s13
 ```
 
 Legend: pink nodes are **Agent** steps; blue nodes are **Augmented LLM** steps (diamond = evaluation gate); green nodes are **System** steps; amber nodes are **Human** steps. Dotted edges are feedback loops or optional steps.

@@ -27,6 +27,7 @@ from comedy_factory.joke_generator import (
     ImageDescription,
     ImagePrompt,
     Joke,
+    Rephrasings,
     Subtext,
     Topic,
     _find_topic_agent,
@@ -37,6 +38,7 @@ from comedy_factory.joke_generator import (
     generate_subtext,
     grade_joke,
     grade_subtext,
+    rephrase_joke,
     save_asset,
     find_topic,
     write_image_prompt,
@@ -183,6 +185,33 @@ def test_write_image_prompt(monkeypatch):
     monkeypatch.setattr(settings, "write_image_prompt_model", canned_model(canned))
     joke = Joke(text="A fake joke.", rationale="Irony.")
     assert write_image_prompt(joke).text == "A fake image prompt."
+
+
+def test_rephrase_joke(monkeypatch):
+    canned = Rephrasings(texts=["Alt one.", "Alt two."]).model_dump_json()
+    monkeypatch.setattr(settings, "rephrase_joke_model", canned_model(canned))
+    rephrasings = rephrase_joke(Joke(text="A fake joke.", rationale="Irony."))
+    assert rephrasings.texts == ["Alt one.", "Alt two."]
+
+
+def test_rephrase_joke_requests_configured_count(monkeypatch):
+    prompts = []
+
+    def model(messages: list, info: AgentInfo) -> ModelResponse:
+        prompts.append(messages[0].parts[0].content)
+        text = Rephrasings(texts=["Alt one."]).model_dump_json()
+        return ModelResponse(parts=[TextPart(content=text)])
+
+    monkeypatch.setattr(settings, "rephrasing_count", 5)
+    monkeypatch.setattr(
+        settings, "rephrase_joke_model", FunctionModel(model, profile=_PROFILE)
+    )
+
+    rephrase_joke(Joke(text="A fake joke.", rationale="Irony."))
+
+    [prompt] = prompts
+    assert "write 5 alternative phrasings" in prompt
+    assert "exactly 5" in prompt
 
 
 def test_generate_image_cloudflare(monkeypatch, image_api_calls):
@@ -385,9 +414,11 @@ def test_save_asset(monkeypatch, tmp_path):
         topic=Topic(text="A fake topic.", source_url="https://example.com/story"),
         subtext=Subtext(text="A fake subtext."),
         joke=Joke(text="A fake joke.", rationale="Irony."),
+        rephrasings=Rephrasings(texts=["Alt one.", "Alt two."]),
         image_prompt=ImagePrompt(text="A fake image prompt."),
         image=b"original-bytes",
         captioned_image=FAKE_IMAGE_BYTES,
+        rephrased_images=[b"alt-1-bytes", b"alt-2-bytes"],
         image_description=ImageDescription(text="A gray rectangle."),
         evaluation=Grade(passed=True),
     )
@@ -395,11 +426,14 @@ def test_save_asset(monkeypatch, tmp_path):
     assert bundle_dir.parent == tmp_path / "output"
     assert (bundle_dir / "image-original.jpg").read_bytes() == b"original-bytes"
     assert (bundle_dir / "image-captioned.jpg").read_bytes() == FAKE_IMAGE_BYTES
+    assert (bundle_dir / "image-rephrased-1.jpg").read_bytes() == b"alt-1-bytes"
+    assert (bundle_dir / "image-rephrased-2.jpg").read_bytes() == b"alt-2-bytes"
     metadata = json.loads((bundle_dir / "metadata.json").read_text())
     assert metadata["topic"]["text"] == "A fake topic."
     assert metadata["topic"]["source_url"] == "https://example.com/story"
     assert metadata["subtext"]["text"] == "A fake subtext."
     assert metadata["joke"]["text"] == "A fake joke."
+    assert metadata["rephrasings"] == ["Alt one.", "Alt two."]
     assert metadata["image_prompt"]["text"] == "A fake image prompt."
     assert metadata["image_description"]["text"] == "A gray rectangle."
     assert metadata["alt_text"] == 'A gray rectangle. Caption reads: "A fake joke."'
@@ -414,6 +448,7 @@ def _set_all_step_models(monkeypatch, model):
         "grade_subtext_model",
         "generate_joke_model",
         "grade_joke_model",
+        "rephrase_joke_model",
         "write_image_prompt_model",
         "describe_image_model",
         "google_image_model",
@@ -442,6 +477,8 @@ def _pipeline_model(messages: list, info: AgentInfo) -> ModelResponse:
         text = ImagePrompt(text="A fake image prompt.").model_dump_json()
     elif schema_name == "ImageDescription":
         text = ImageDescription(text="A gray rectangle.").model_dump_json()
+    elif schema_name == "Rephrasings":
+        text = Rephrasings(texts=["Alt one.", "Alt two."]).model_dump_json()
     else:
         raise AssertionError(f"Unexpected request schema: {schema_name}")
     return ModelResponse(parts=[TextPart(content=text)])
@@ -458,19 +495,23 @@ def test_main_smoke(monkeypatch, tmp_path, log_output):
     assert "Subtext: A fake subtext." in out
     assert "Joke: A fake joke." in out
     assert "Rationale: Irony." in out
+    assert "Rephrasing 1: Alt one." in out
+    assert "Rephrasing 2: Alt two." in out
     assert "Image prompt: A fake image prompt." in out
     assert 'Alt text: A gray rectangle. Caption reads: "A fake joke."' in out
     assert "Asset bundle saved to" in out
 
     [bundle_dir] = list((tmp_path / "output").iterdir())
     assert (bundle_dir / "image-original.jpg").read_bytes() == FAKE_IMAGE_BYTES
-    # The captioned image is the generated image plus the rendered caption bar.
-    saved = Image.open(bundle_dir / "image-captioned.jpg")
-    assert saved.format == "JPEG"
-    assert saved.width == 64
-    assert saved.height > 48
+    # The captioned images are the generated image plus a rendered caption bar.
+    for name in ("image-captioned", "image-rephrased-1", "image-rephrased-2"):
+        saved = Image.open(bundle_dir / f"{name}.jpg")
+        assert saved.format == "JPEG"
+        assert saved.width == 64
+        assert saved.height > 48
     metadata = json.loads((bundle_dir / "metadata.json").read_text())
     assert metadata["joke"]["text"] == "A fake joke."
+    assert metadata["rephrasings"] == ["Alt one.", "Alt two."]
     assert metadata["alt_text"] == 'A gray rectangle. Caption reads: "A fake joke."'
 
 
@@ -496,6 +537,8 @@ def test_main_retries_failed_joke_grading(monkeypatch, tmp_path, log_output):
             text = ImagePrompt(text="A fake image prompt.").model_dump_json()
         elif schema_name == "ImageDescription":
             text = ImageDescription(text="A gray rectangle.").model_dump_json()
+        elif schema_name == "Rephrasings":
+            text = Rephrasings(texts=["Alt one.", "Alt two."]).model_dump_json()
         else:
             raise AssertionError(f"Unexpected request schema: {schema_name}")
         return ModelResponse(parts=[TextPart(content=text)])

@@ -16,28 +16,34 @@ filter" (irony, character, shock, hyperbole) into a short joke.
 Step 5 — Grade joke: evaluation gate. If the joke breaks a rule, the workflow
 re-runs step 4 with the grader's feedback.
 
-Step 6 — Write image prompt: LLM step that writes a text-to-image prompt for a
+Step 6 — Rephrase joke: LLM step that writes N alternative phrasings of the
+approved joke for later human review and possible recaptioning. No grading
+gate — the human review is the evaluation.
+
+Step 7 — Write image prompt: LLM step that writes a text-to-image prompt for a
 text-free image that plays the joke straight; the joke text is rendered onto
 the image later as a caption.
 
-Step 7 — Generate image: renders the image prompt with the configured provider
+Step 8 — Generate image: renders the image prompt with the configured provider
 — a Gemini image model ("Nano Banana") or FLUX.1-schnell on Cloudflare Workers
 AI — and returns the image bytes.
 
-Step 8 — Render caption: system step that word-wraps the joke text into a
-white caption bar beneath the image and returns the combined JPEG bytes.
+Step 9 — Render caption: system step that word-wraps the joke text into a
+white caption bar beneath the image and returns the combined JPEG bytes; also
+renders one captioned image per rephrasing from the same base image.
 
-Step 9 — Describe image: vision LLM step that writes a factual visual
+Step 10 — Describe image: vision LLM step that writes a factual visual
 description of the generated (uncaptioned) image. The posting alt text is
 this description with the caption sentence templated on, so a recaption can
 rebuild the alt text without another vision call.
 
-Step 10 — Evaluate joke holistically: evaluation of the finished asset as a
+Step 11 — Evaluate joke holistically: evaluation of the finished asset as a
 whole. Placeholder for now — the criteria are undecided, so everything passes;
 the verdict is recorded in the asset bundle rather than blocking it.
 
-Step 11 — Save asset: system step that writes the run's artifacts (original
-image, captioned image, and metadata) to a timestamped output directory.
+Step 12 — Save asset: system step that writes the run's artifacts (original
+image, captioned images including the rephrased versions, and metadata) to a
+timestamped output directory.
 """
 
 import base64
@@ -154,6 +160,19 @@ class ImagePrompt(BaseModel):
     )
 
 
+class Rephrasings(BaseModel):
+    """Alternative phrasings of the approved joke, for human review and
+    possible recaptioning."""
+
+    texts: list[str] = Field(
+        description=(
+            "The alternative phrasings of the joke, each one complete joke"
+            " text and nothing else — no numbering, no explanation, no"
+            " surrounding quotation marks."
+        )
+    )
+
+
 class ImageDescription(BaseModel):
     """A factual visual description of the generated image — the part of the
     posting alt text that precedes the templated caption sentence."""
@@ -195,6 +214,14 @@ _image_description_request_parameters = ModelRequestParameters(
     output_object=OutputObjectDefinition(
         name=ImageDescription.__name__,
         json_schema=ImageDescription.model_json_schema(),
+    ),
+)
+
+_rephrasings_request_parameters = ModelRequestParameters(
+    output_mode="native",
+    output_object=OutputObjectDefinition(
+        name=Rephrasings.__name__,
+        json_schema=Rephrasings.model_json_schema(),
     ),
 )
 
@@ -328,6 +355,28 @@ def write_image_prompt(joke: Joke) -> ImagePrompt:
     return ImagePrompt.model_validate_json(response_text(response))
 
 
+def rephrase_joke(joke: Joke) -> Rephrasings:
+    """Return alternative phrasings of the approved joke for human review.
+
+    This step has no grading gate and no retry conversation — the subsequent
+    human review is the evaluation.
+    """
+    prompt = load_prompt(
+        "rephrase-joke.md",
+        JOKE=joke.text,
+        RATIONALE=joke.rationale,
+        N=settings.rephrasing_count,
+    )
+
+    response = model_request_sync(
+        settings.rephrase_joke_model,
+        [ModelRequest.user_text_prompt(prompt)],
+        model_request_parameters=_rephrasings_request_parameters,
+    )
+
+    return Rephrasings.model_validate_json(response_text(response))
+
+
 def generate_image(image_prompt: ImagePrompt) -> bytes:
     """Render the image prompt with the configured image provider."""
     if settings.image_provider == "cloudflare":
@@ -439,9 +488,11 @@ def save_asset(
     topic: Topic,
     subtext: Subtext,
     joke: Joke,
+    rephrasings: Rephrasings,
     image_prompt: ImagePrompt,
     image: bytes,
     captioned_image: bytes,
+    rephrased_images: list[bytes],
     image_description: ImageDescription,
     evaluation: Grade,
 ) -> Path:
@@ -452,12 +503,17 @@ def save_asset(
 
     (bundle_dir / "image-original.jpg").write_bytes(image)
     (bundle_dir / "image-captioned.jpg").write_bytes(captioned_image)
+    # 1-based, in metadata order, so humans can map image file to rephrasing.
+    # The `image-captioned-*` prefix is owned by recaption.py's versioning.
+    for index, rephrased_image in enumerate(rephrased_images, 1):
+        (bundle_dir / f"image-rephrased-{index}.jpg").write_bytes(rephrased_image)
 
     metadata = {
         "created_at": created_at.isoformat(),
         "topic": topic.model_dump(),
         "subtext": subtext.model_dump(),
         "joke": joke.model_dump(),
+        "rephrasings": rephrasings.texts,
         "image_prompt": image_prompt.model_dump(),
         "image_description": image_description.model_dump(),
         "alt_text": compose_alt_text(image_description.text, joke.text),
@@ -505,11 +561,16 @@ def main():
     logger.info(f"Joke: {joke.text}")
     logger.info(f"Rationale: {joke.rationale}")
 
+    rephrasings = rephrase_joke(joke)
+    for index, text in enumerate(rephrasings.texts, 1):
+        logger.info(f"Rephrasing {index}: {text}")
+
     image_prompt = write_image_prompt(joke)
     logger.info(f"Image prompt: {image_prompt.text}")
 
     image = generate_image(image_prompt)
     captioned = render_caption(image, joke.text)
+    rephrased_images = [render_caption(image, text) for text in rephrasings.texts]
 
     image_description = describe_image(image)
     logger.info(f"Alt text: {compose_alt_text(image_description.text, joke.text)}")
@@ -519,9 +580,11 @@ def main():
         topic,
         subtext,
         joke,
+        rephrasings,
         image_prompt,
         image,
         captioned,
+        rephrased_images,
         image_description,
         evaluation,
     )

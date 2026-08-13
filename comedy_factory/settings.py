@@ -16,6 +16,7 @@ class Settings(BaseSettings):
     grade_subtext_model: str = "google-cloud:gemini-3.5-flash"
     generate_joke_model: str = "google-cloud:gemini-3.5-flash"
     grade_joke_model: str = "google-cloud:gemini-3.5-flash"
+    rephrase_joke_model: str = "google-cloud:gemini-3.5-flash"
     write_image_prompt_model: str = "google-cloud:gemini-3.5-flash"
     describe_image_model: str = "google-cloud:gemini-3.5-flash"
     prompts_dir: Path = Path(__file__).parent.parent / "prompts"
@@ -23,6 +24,8 @@ class Settings(BaseSettings):
     max_grade_attempts: int = 3
     max_recent_topics: int = 20
     """How many recent bundle topics to feed the topic scan as stories to avoid."""
+    rephrasing_count: int = 3
+    """How many alternative phrasings of the approved joke to generate."""
 
     # Vertex AI region for the google-cloud: models. Newer Gemini models are
     # served from the "global" endpoint, not the provider's us-central1

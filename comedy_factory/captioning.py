@@ -1,4 +1,4 @@
-"""Rendering a joke caption onto an image (workflow step 8)."""
+"""Rendering a joke caption onto an image (workflow step 9)."""
 
 import io
 

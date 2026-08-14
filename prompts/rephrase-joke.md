@@ -6,8 +6,8 @@ Your task is to write {N} alternative phrasings of the joke below. The joke has 
 
 Each alternative phrasing must:
 
-* Tell the same joke: preserve the joke's meaning and the mechanism described in the rationale.
-* Keep the funny part last.
+* Preserve the meaning and the mechanism described in the rationale.
+* Be shorter or just as long as the original.
 * Differ meaningfully from the original and from the other alternatives in wording or sentence structure — vary the surface, not the joke.
 * Be a complete, self-contained caption of similar length to the original.
 

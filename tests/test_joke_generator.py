@@ -28,6 +28,7 @@ from comedy_factory.joke_generator import (
     ImagePrompt,
     Joke,
     Rephrasings,
+    StepCost,
     Subtext,
     Topic,
     _find_topic_agent,
@@ -102,7 +103,7 @@ def image_api_calls(monkeypatch):
 def test_find_topic_returns_bare_topic():
     canned = "* A fake topic.\n\nSome trailing explanation."
     with _find_topic_agent.override(model=canned_model(canned), native_tools=[]):
-        topic = find_topic()
+        topic, _ = find_topic()
     assert topic.text == "A fake topic."
     assert topic.source_url is None
 
@@ -110,7 +111,7 @@ def test_find_topic_returns_bare_topic():
 def test_find_topic_parses_source_url():
     canned = "A fake topic.\nhttps://example.com/story"
     with _find_topic_agent.override(model=canned_model(canned), native_tools=[]):
-        topic = find_topic()
+        topic, _ = find_topic()
     assert topic.text == "A fake topic."
     assert topic.source_url == "https://example.com/story"
 
@@ -118,7 +119,7 @@ def test_find_topic_parses_source_url():
 def test_find_topic_ignores_url_ordering():
     canned = "https://example.com/story\nA fake topic."
     with _find_topic_agent.override(model=canned_model(canned), native_tools=[]):
-        topic = find_topic()
+        topic, _ = find_topic()
     assert topic.text == "A fake topic."
     assert topic.source_url == "https://example.com/story"
 
@@ -143,7 +144,7 @@ def test_find_topic_feeds_recent_topics_to_prompt(monkeypatch, tmp_path):
     with _find_topic_agent.override(
         model=FunctionModel(model, profile=_PROFILE), native_tools=[]
     ):
-        topic = find_topic()
+        topic, _ = find_topic()
 
     assert topic.text == "A fresh topic."
     [prompt] = prompts
@@ -154,16 +155,17 @@ def test_find_topic_feeds_recent_topics_to_prompt(monkeypatch, tmp_path):
 def test_generate_subtext(monkeypatch):
     canned = Subtext(text="A fake subtext.").model_dump_json()
     monkeypatch.setattr(settings, "generate_subtext_model", canned_model(canned))
-    subtext, history = generate_subtext("A fake topic.")
+    subtext, history, cost = generate_subtext("A fake topic.")
     assert subtext.text == "A fake subtext."
     assert len(history) == 2  # templated prompt + model response
+    assert isinstance(cost, StepCost)
 
 
 def test_generate_subtext_retry_extends_history(monkeypatch):
     canned = Subtext(text="A better subtext.").model_dump_json()
     monkeypatch.setattr(settings, "generate_subtext_model", canned_model(canned))
-    _, history = generate_subtext("A fake topic.")
-    subtext, history = generate_subtext(
+    _, history, _ = generate_subtext("A fake topic.")
+    subtext, history, _ = generate_subtext(
         "A fake topic.", history=history, feedback="* Too wordy."
     )
     assert subtext.text == "A better subtext."
@@ -174,7 +176,7 @@ def test_generate_subtext_retry_extends_history(monkeypatch):
 def test_generate_joke(monkeypatch):
     canned = Joke(text="A fake joke.", rationale="Irony.").model_dump_json()
     monkeypatch.setattr(settings, "generate_joke_model", canned_model(canned))
-    joke, history = generate_joke("A fake subtext.")
+    joke, history, _ = generate_joke("A fake subtext.")
     assert joke.text == "A fake joke."
     assert joke.rationale == "Irony."
     assert len(history) == 2
@@ -184,13 +186,14 @@ def test_write_image_prompt(monkeypatch):
     canned = ImagePrompt(text="A fake image prompt.").model_dump_json()
     monkeypatch.setattr(settings, "write_image_prompt_model", canned_model(canned))
     joke = Joke(text="A fake joke.", rationale="Irony.")
-    assert write_image_prompt(joke).text == "A fake image prompt."
+    image_prompt, _ = write_image_prompt(joke)
+    assert image_prompt.text == "A fake image prompt."
 
 
 def test_rephrase_joke(monkeypatch):
     canned = Rephrasings(texts=["Alt one.", "Alt two."]).model_dump_json()
     monkeypatch.setattr(settings, "rephrase_joke_model", canned_model(canned))
-    rephrasings = rephrase_joke(Joke(text="A fake joke.", rationale="Irony."))
+    rephrasings, _ = rephrase_joke(Joke(text="A fake joke.", rationale="Irony."))
     assert rephrasings.texts == ["Alt one.", "Alt two."]
 
 
@@ -219,9 +222,11 @@ def test_generate_image_cloudflare(monkeypatch, image_api_calls):
     monkeypatch.setattr(settings, "cloudflare_account_id", "test-account")
     monkeypatch.setattr(settings, "cloudflare_api_token", "test-token")
 
-    image = generate_image(ImagePrompt(text="A fake image prompt."))
+    image, cost = generate_image(ImagePrompt(text="A fake image prompt."))
 
     assert image == FAKE_IMAGE_BYTES
+    # Cloudflare reports no usage, so the step's cost is empty/unknown.
+    assert cost == StepCost()
     (url, kwargs), = image_api_calls
     assert "test-account" in url
     assert url.endswith(settings.cloudflare_image_model)
@@ -243,7 +248,7 @@ def test_generate_image_google(monkeypatch):
     monkeypatch.setattr(settings, "image_provider", "google")
     monkeypatch.setattr(settings, "google_image_model", FunctionModel(model, profile=_PROFILE))
 
-    image = generate_image(ImagePrompt(text="A fake image prompt."))
+    image, _ = generate_image(ImagePrompt(text="A fake image prompt."))
     assert image == FAKE_IMAGE_BYTES
 
 
@@ -259,7 +264,7 @@ def test_describe_image_sends_image_to_model(monkeypatch):
         settings, "describe_image_model", FunctionModel(model, profile=_PROFILE)
     )
 
-    description = describe_image(FAKE_IMAGE_BYTES)
+    description, _ = describe_image(FAKE_IMAGE_BYTES)
 
     assert description.text == "A gray rectangle."
     [(prompt, image)] = contents
@@ -375,7 +380,7 @@ def test_recaption_requires_original_image(tmp_path):
 def test_grade_subtext_pass(monkeypatch):
     canned = Grade(passed=True).model_dump_json()
     monkeypatch.setattr(settings, "grade_subtext_model", canned_model(canned))
-    grade = grade_subtext("A fake topic.", "A fake subtext.")
+    grade, _ = grade_subtext("A fake topic.", "A fake subtext.")
     assert grade.passed
     assert grade.feedback == ""
 
@@ -383,7 +388,7 @@ def test_grade_subtext_pass(monkeypatch):
 def test_grade_subtext_fail(monkeypatch):
     canned = Grade(passed=False, feedback="* Not a simple sentence.").model_dump_json()
     monkeypatch.setattr(settings, "grade_subtext_model", canned_model(canned))
-    grade = grade_subtext("A fake topic.", "A fake subtext.")
+    grade, _ = grade_subtext("A fake topic.", "A fake subtext.")
     assert not grade.passed
     assert grade.feedback == "* Not a simple sentence."
 
@@ -391,9 +396,19 @@ def test_grade_subtext_fail(monkeypatch):
 def test_grade_joke_fail(monkeypatch):
     canned = Grade(passed=False, feedback="* The funny part is not last.").model_dump_json()
     monkeypatch.setattr(settings, "grade_joke_model", canned_model(canned))
-    grade = grade_joke("A fake subtext.", "A fake joke.")
+    grade, _ = grade_joke("A fake subtext.", "A fake joke.")
     assert not grade.passed
     assert grade.feedback == "* The funny part is not last."
+
+
+def test_step_cost_addition_sums_tokens_and_known_costs():
+    priced = StepCost(input_tokens=10, output_tokens=5, usd=0.01)
+    unpriced = StepCost(input_tokens=1, output_tokens=2)
+    total = priced + unpriced
+    assert total.input_tokens == 11
+    assert total.output_tokens == 7
+    assert total.usd == 0.01
+    assert (unpriced + unpriced).usd is None
 
 
 def test_grade_asset_is_a_passthrough():
@@ -420,6 +435,10 @@ def test_save_asset(monkeypatch, tmp_path):
         captioned_image=FAKE_IMAGE_BYTES,
         rephrased_images=[b"alt-1-bytes", b"alt-2-bytes"],
         image_description=ImageDescription(text="A gray rectangle."),
+        costs={
+            "generate_joke": StepCost(input_tokens=100, output_tokens=20, usd=0.001),
+            "generate_image": StepCost(),
+        },
         evaluation=Grade(passed=True),
     )
 
@@ -438,6 +457,13 @@ def test_save_asset(monkeypatch, tmp_path):
     assert metadata["image_description"]["text"] == "A gray rectangle."
     assert metadata["alt_text"] == 'A gray rectangle. Caption reads: "A fake joke."'
     assert metadata["evaluation"]["passed"] is True
+    assert metadata["costs"]["steps"]["generate_joke"]["input_tokens"] == 100
+    assert metadata["costs"]["steps"]["generate_image"]["usd"] is None
+    assert metadata["costs"]["total"] == {
+        "input_tokens": 100,
+        "output_tokens": 20,
+        "usd": 0.001,
+    }
     assert "created_at" in metadata
 
 
@@ -499,6 +525,7 @@ def test_main_smoke(monkeypatch, tmp_path, log_output):
     assert "Rephrasing 2: Alt two." in out
     assert "Image prompt: A fake image prompt." in out
     assert 'Alt text: A gray rectangle. Caption reads: "A fake joke."' in out
+    assert "estimated cost" in out
     assert "Asset bundle saved to" in out
 
     [bundle_dir] = list((tmp_path / "output").iterdir())
@@ -513,6 +540,18 @@ def test_main_smoke(monkeypatch, tmp_path, log_output):
     assert metadata["joke"]["text"] == "A fake joke."
     assert metadata["rephrasings"] == ["Alt one.", "Alt two."]
     assert metadata["alt_text"] == 'A gray rectangle. Caption reads: "A fake joke."'
+    assert set(metadata["costs"]["steps"]) == {
+        "find_topic",
+        "generate_subtext",
+        "grade_subtext",
+        "generate_joke",
+        "grade_joke",
+        "rephrase_joke",
+        "write_image_prompt",
+        "generate_image",
+        "describe_image",
+    }
+    assert set(metadata["costs"]["total"]) == {"input_tokens", "output_tokens", "usd"}
 
 
 def test_main_retries_failed_joke_grading(monkeypatch, tmp_path, log_output):

@@ -44,11 +44,16 @@ the verdict is recorded in the asset bundle rather than blocking it.
 Step 12 — Save asset: system step that writes the run's artifacts (original
 image, captioned images including the rephrased versions, and metadata) to a
 timestamped output directory.
+
+Each LLM step also surfaces its token usage and estimated cost (priced via
+genai-prices); main() accumulates them per step and the totals are recorded
+in the asset bundle's metadata.
 """
 
 import base64
 import json
 import re
+from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 
@@ -63,6 +68,7 @@ from pydantic_ai.messages import (
     BinaryImage,
     ModelMessage,
     ModelRequest,
+    ModelResponse,
     UserPromptPart,
 )
 from pydantic_ai.models import ModelRequestParameters
@@ -160,6 +166,45 @@ class ImagePrompt(BaseModel):
     )
 
 
+class StepCost(BaseModel):
+    """Token usage and estimated cost of a pipeline step's model calls.
+
+    `usd` is a genai-prices estimate; None means no price is known (models
+    missing from the price table, or providers that report no usage). Adding
+    StepCosts sums the tokens and the known usd components; the sum's usd is
+    None only when every component is unknown.
+    """
+
+    input_tokens: int = 0
+    output_tokens: int = 0
+    usd: float | None = None
+
+    def __add__(self, other: "StepCost") -> "StepCost":
+        if self.usd is None and other.usd is None:
+            usd = None
+        else:
+            usd = (self.usd or 0.0) + (other.usd or 0.0)
+        return StepCost(
+            input_tokens=self.input_tokens + other.input_tokens,
+            output_tokens=self.output_tokens + other.output_tokens,
+            usd=usd,
+        )
+
+
+def _response_cost(response: ModelResponse) -> StepCost:
+    """Token usage and estimated cost of a single model response."""
+    try:
+        usd = float(response.cost().total_price)
+    except Exception:
+        # genai-prices has no entry for every model (image models, test stubs).
+        usd = None
+    return StepCost(
+        input_tokens=response.usage.input_tokens,
+        output_tokens=response.usage.output_tokens,
+        usd=usd,
+    )
+
+
 class Rephrasings(BaseModel):
     """Alternative phrasings of the approved joke, for human review and
     possible recaptioning."""
@@ -248,14 +293,24 @@ def _recent_topics() -> list[str]:
     return topics
 
 
-def find_topic() -> Topic:
+def find_topic() -> tuple[Topic, StepCost]:
     """Return a factual news topic suitable for joke writing, with its source
-    URL when the model provides one. Topics of recent asset bundles are passed
-    to the model as stories to avoid."""
+    URL when the model provides one, along with the step's usage and cost.
+    Topics of recent asset bundles are passed to the model as stories to
+    avoid."""
     recent = "\n".join(f"* {topic}" for topic in _recent_topics()) or "(none)"
     prompt = load_prompt("find-topic.md", RECENT_TOPICS=recent)
 
     result = _find_topic_agent.run_sync(prompt)
+    # The agent may take several turns (search tool loop); sum them all.
+    cost = sum(
+        (
+            _response_cost(message)
+            for message in result.all_messages()
+            if isinstance(message, ModelResponse)
+        ),
+        StepCost(),
+    )
 
     # The prompt demands the bare topic line followed by the source URL; strip
     # any numbering/bullets or extra lines that slip through anyway.
@@ -270,16 +325,17 @@ def find_topic() -> Topic:
         raise RuntimeError("News scan returned no topic")
 
     url_match = re.search(r"https?://\S+", result.output)
-    return Topic(text=text, source_url=url_match.group() if url_match else None)
+    topic = Topic(text=text, source_url=url_match.group() if url_match else None)
+    return topic, cost
 
 
 def generate_subtext(
     topic: str,
     history: list[ModelMessage] | None = None,
     feedback: str | None = None,
-) -> tuple[Subtext, list[ModelMessage]]:
-    """Return a subtext — the writer's opinion about a news topic — and the
-    conversation history that produced it.
+) -> tuple[Subtext, list[ModelMessage], StepCost]:
+    """Return a subtext — the writer's opinion about a news topic — the
+    conversation history that produced it, and the call's usage and cost.
 
     To request a rewrite after a failed grading, pass back the returned
     `history` along with the grader's `feedback`; the model then sees its
@@ -302,16 +358,18 @@ def generate_subtext(
     )
     history.append(response)
 
-    return Subtext.model_validate_json(response_text(response)), history
+    subtext = Subtext.model_validate_json(response_text(response))
+    return subtext, history, _response_cost(response)
 
 
 def generate_joke(
     subtext: str,
     history: list[ModelMessage] | None = None,
     feedback: str | None = None,
-) -> tuple[Joke, list[ModelMessage]]:
+) -> tuple[Joke, list[ModelMessage], StepCost]:
     """Return a joke communicating the subtext — along with the rationale
-    behind its construction — and the conversation history that produced it.
+    behind its construction — the conversation history that produced it, and
+    the call's usage and cost.
 
     To request a rewrite after a failed grading, pass back the returned
     `history` along with the grader's `feedback`; the model then sees its
@@ -334,11 +392,13 @@ def generate_joke(
     )
     history.append(response)
 
-    return Joke.model_validate_json(response_text(response)), history
+    joke = Joke.model_validate_json(response_text(response))
+    return joke, history, _response_cost(response)
 
 
-def write_image_prompt(joke: Joke) -> ImagePrompt:
-    """Return a text-to-image prompt for the image that accompanies the joke.
+def write_image_prompt(joke: Joke) -> tuple[ImagePrompt, StepCost]:
+    """Return a text-to-image prompt for the image that accompanies the joke,
+    along with the call's usage and cost.
 
     This step has no grading gate and no retry conversation — a single call.
     """
@@ -352,11 +412,13 @@ def write_image_prompt(joke: Joke) -> ImagePrompt:
         model_request_parameters=_image_prompt_request_parameters,
     )
 
-    return ImagePrompt.model_validate_json(response_text(response))
+    image_prompt = ImagePrompt.model_validate_json(response_text(response))
+    return image_prompt, _response_cost(response)
 
 
-def rephrase_joke(joke: Joke) -> Rephrasings:
-    """Return alternative phrasings of the approved joke for human review.
+def rephrase_joke(joke: Joke) -> tuple[Rephrasings, StepCost]:
+    """Return alternative phrasings of the approved joke for human review,
+    along with the call's usage and cost.
 
     This step has no grading gate and no retry conversation — the subsequent
     human review is the evaluation.
@@ -374,27 +436,29 @@ def rephrase_joke(joke: Joke) -> Rephrasings:
         model_request_parameters=_rephrasings_request_parameters,
     )
 
-    return Rephrasings.model_validate_json(response_text(response))
+    rephrasings = Rephrasings.model_validate_json(response_text(response))
+    return rephrasings, _response_cost(response)
 
 
-def generate_image(image_prompt: ImagePrompt) -> bytes:
-    """Render the image prompt with the configured image provider."""
+def generate_image(image_prompt: ImagePrompt) -> tuple[bytes, StepCost]:
+    """Render the image prompt with the configured image provider; returns the
+    image bytes and the call's usage and cost."""
     if settings.image_provider == "cloudflare":
         return _generate_image_cloudflare(image_prompt)
     return _generate_image_google(image_prompt)
 
 
-def _generate_image_google(image_prompt: ImagePrompt) -> bytes:
+def _generate_image_google(image_prompt: ImagePrompt) -> tuple[bytes, StepCost]:
     """Generate the image with a Gemini image model ("Nano Banana")."""
     response = model_request_sync(
         settings.google_image_model,
         [ModelRequest.user_text_prompt(image_prompt.text)],
         model_request_parameters=ModelRequestParameters(allow_image_output=True),
     )
-    return response_image(response)
+    return response_image(response), _response_cost(response)
 
 
-def _generate_image_cloudflare(image_prompt: ImagePrompt) -> bytes:
+def _generate_image_cloudflare(image_prompt: ImagePrompt) -> tuple[bytes, StepCost]:
     """Generate the image with FLUX on Cloudflare Workers AI."""
     response = httpx.post(
         "https://api.cloudflare.com/client/v4/accounts/"
@@ -408,11 +472,13 @@ def _generate_image_cloudflare(image_prompt: ImagePrompt) -> bytes:
     payload = response.json()
     if not payload.get("success"):
         raise RuntimeError(f"Image generation failed: {payload.get('errors')}")
-    return base64.b64decode(payload["result"]["image"])
+    # Cloudflare reports no usage; it bills per image ("neurons") on its side.
+    return base64.b64decode(payload["result"]["image"]), StepCost()
 
 
-def describe_image(image: bytes) -> ImageDescription:
-    """Return a factual visual description of the generated image.
+def describe_image(image: bytes) -> tuple[ImageDescription, StepCost]:
+    """Return a factual visual description of the generated image, along with
+    the call's usage and cost.
 
     The description covers only what is visible in the image — the caption
     sentence of the alt text is templated on by `compose_alt_text`, never read
@@ -439,10 +505,11 @@ def describe_image(image: bytes) -> ImageDescription:
         model_request_parameters=_image_description_request_parameters,
     )
 
-    return ImageDescription.model_validate_json(response_text(response))
+    image_description = ImageDescription.model_validate_json(response_text(response))
+    return image_description, _response_cost(response)
 
 
-def grade_subtext(topic: str, subtext: str) -> Grade:
+def grade_subtext(topic: str, subtext: str) -> tuple[Grade, StepCost]:
     """Evaluate a subtext against the rules; a fail comes with feedback."""
     prompt = load_prompt("evaluate-subtext.md", TOPIC=topic, SUBTEXT=subtext)
 
@@ -452,10 +519,10 @@ def grade_subtext(topic: str, subtext: str) -> Grade:
         model_request_parameters=_grade_request_parameters,
     )
 
-    return Grade.model_validate_json(response_text(response))
+    return Grade.model_validate_json(response_text(response)), _response_cost(response)
 
 
-def grade_joke(subtext: str, joke: str) -> Grade:
+def grade_joke(subtext: str, joke: str) -> tuple[Grade, StepCost]:
     """Evaluate a joke against the rules; a fail comes with feedback."""
     prompt = load_prompt("evaluate-joke.md", SUBTEXT=subtext, JOKE=joke)
 
@@ -465,7 +532,7 @@ def grade_joke(subtext: str, joke: str) -> Grade:
         model_request_parameters=_grade_request_parameters,
     )
 
-    return Grade.model_validate_json(response_text(response))
+    return Grade.model_validate_json(response_text(response)), _response_cost(response)
 
 
 def grade_asset(
@@ -494,6 +561,7 @@ def save_asset(
     captioned_image: bytes,
     rephrased_images: list[bytes],
     image_description: ImageDescription,
+    costs: dict[str, StepCost],
     evaluation: Grade,
 ) -> Path:
     """Write the run's artifacts to a timestamped directory; returns its path."""
@@ -518,6 +586,10 @@ def save_asset(
         "image_description": image_description.model_dump(),
         "alt_text": compose_alt_text(image_description.text, joke.text),
         "evaluation": evaluation.model_dump(),
+        "costs": {
+            "steps": {step: cost.model_dump() for step, cost in costs.items()},
+            "total": sum(costs.values(), StepCost()).model_dump(),
+        },
     }
     (bundle_dir / "metadata.json").write_text(json.dumps(metadata, indent=2))
 
@@ -526,15 +598,20 @@ def save_asset(
 
 def main():
     """Execute the joke generator workflow."""
-    topic = find_topic()
+    costs: defaultdict[str, StepCost] = defaultdict(StepCost)
+
+    topic, cost = find_topic()
+    costs["find_topic"] += cost
     logger.info(f"Topic: {topic.text}")
     logger.info(f"Source: {topic.source_url}")
 
     history = None
     feedback = None
     for attempt in range(1, settings.max_grade_attempts + 1):
-        subtext, history = generate_subtext(topic.text, history, feedback)
-        grade = grade_subtext(topic.text, subtext.text)
+        subtext, history, cost = generate_subtext(topic.text, history, feedback)
+        costs["generate_subtext"] += cost
+        grade, cost = grade_subtext(topic.text, subtext.text)
+        costs["grade_subtext"] += cost
         if grade.passed:
             break
         feedback = grade.feedback
@@ -548,8 +625,10 @@ def main():
     history = None
     feedback = None
     for attempt in range(1, settings.max_grade_attempts + 1):
-        joke, history = generate_joke(subtext.text, history, feedback)
-        grade = grade_joke(subtext.text, joke.text)
+        joke, history, cost = generate_joke(subtext.text, history, feedback)
+        costs["generate_joke"] += cost
+        grade, cost = grade_joke(subtext.text, joke.text)
+        costs["grade_joke"] += cost
         if grade.passed:
             break
         feedback = grade.feedback
@@ -561,19 +640,30 @@ def main():
     logger.info(f"Joke: {joke.text}")
     logger.info(f"Rationale: {joke.rationale}")
 
-    rephrasings = rephrase_joke(joke)
+    rephrasings, cost = rephrase_joke(joke)
+    costs["rephrase_joke"] += cost
     for index, text in enumerate(rephrasings.texts, 1):
         logger.info(f"Rephrasing {index}: {text}")
 
-    image_prompt = write_image_prompt(joke)
+    image_prompt, cost = write_image_prompt(joke)
+    costs["write_image_prompt"] += cost
     logger.info(f"Image prompt: {image_prompt.text}")
 
-    image = generate_image(image_prompt)
+    image, cost = generate_image(image_prompt)
+    costs["generate_image"] += cost
     captioned = render_caption(image, joke.text)
     rephrased_images = [render_caption(image, text) for text in rephrasings.texts]
 
-    image_description = describe_image(image)
+    image_description, cost = describe_image(image)
+    costs["describe_image"] += cost
     logger.info(f"Alt text: {compose_alt_text(image_description.text, joke.text)}")
+
+    total_cost = sum(costs.values(), StepCost())
+    usd = f"${total_cost.usd:.4f}" if total_cost.usd is not None else "unknown"
+    logger.info(
+        f"Usage: {total_cost.input_tokens} input tokens,"
+        f" {total_cost.output_tokens} output tokens, estimated cost {usd}"
+    )
 
     evaluation = grade_asset(topic, subtext, joke, captioned, image_description)
     bundle_dir = save_asset(
@@ -586,6 +676,7 @@ def main():
         captioned,
         rephrased_images,
         image_description,
+        dict(costs),
         evaluation,
     )
     logger.info(f"Asset bundle saved to {bundle_dir}")

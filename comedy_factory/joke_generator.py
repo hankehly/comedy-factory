@@ -59,7 +59,6 @@ from pathlib import Path
 
 import httpx
 from loguru import logger
-
 from pydantic import BaseModel, Field
 from pydantic_ai import Agent
 from pydantic_ai.capabilities import WebSearch

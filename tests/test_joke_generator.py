@@ -12,6 +12,8 @@ Model stubbing follows pydantic-ai's recommended seams:
 import base64
 import io
 import json
+from collections.abc import Callable
+from datetime import datetime
 
 import pytest
 from PIL import Image, ImageFont
@@ -32,20 +34,21 @@ from comedy_factory.joke_generator import (
     Subtext,
     Topic,
     _find_topic_agent,
+    _recent_topics,
     describe_image,
-    grade_asset,
+    find_topic,
     generate_image,
     generate_joke,
     generate_subtext,
+    grade_asset,
     grade_joke,
     grade_subtext,
     rephrase_joke,
     save_asset,
-    find_topic,
     write_image_prompt,
 )
 from comedy_factory.settings import settings
-from comedy_factory.utils import compose_alt_text, image_media_type
+from comedy_factory.utils import compose_alt_text, image_media_type, response_image
 
 # Grading uses output_mode="native" and image generation uses image output;
 # TestModel/FunctionModel default profiles reject both.
@@ -76,6 +79,19 @@ def log_output():
     joke_generator.logger.remove(handler_id)
 
 
+class _FakeCloudflareResponse:
+    """Stand-in for httpx's response from the Workers AI image endpoint."""
+
+    def __init__(self, payload: dict):
+        self._payload = payload
+
+    def raise_for_status(self):
+        return None
+
+    def json(self):
+        return self._payload
+
+
 @pytest.fixture
 def image_api_calls(monkeypatch):
     """Stub the Cloudflare image API at the httpx level; records POST calls."""
@@ -85,16 +101,9 @@ def image_api_calls(monkeypatch):
         "result": {"image": base64.b64encode(FAKE_IMAGE_BYTES).decode()},
     }
 
-    class FakeResponse:
-        def raise_for_status(self):
-            return None
-
-        def json(self):
-            return payload
-
     def fake_post(url, **kwargs):
         calls.append((url, kwargs))
-        return FakeResponse()
+        return _FakeCloudflareResponse(payload)
 
     monkeypatch.setattr(joke_generator.httpx, "post", fake_post)
     return calls
@@ -150,6 +159,38 @@ def test_find_topic_feeds_recent_topics_to_prompt(monkeypatch, tmp_path):
     [prompt] = prompts
     assert "* An old story." in prompt
     assert "* A legacy-format story." in prompt
+
+
+def test_find_topic_rejects_output_without_topic():
+    canned = "https://example.com/story\n\n"
+    with _find_topic_agent.override(model=canned_model(canned), native_tools=[]):
+        with pytest.raises(RuntimeError, match="no topic"):
+            find_topic()
+
+
+def test_recent_topics_skips_unreadable_bundles_and_caps_the_count(monkeypatch, tmp_path):
+    output_dir = tmp_path / "output"
+    monkeypatch.setattr(settings, "output_dir", output_dir)
+    monkeypatch.setattr(settings, "max_recent_topics", 2)
+    bundles = {
+        "20260101-000000": json.dumps({"topic": {"text": "The oldest story."}}),
+        "20260102-000000": json.dumps({"topic": {"text": "An old story."}}),
+        "20260103-000000": json.dumps({"topic": {"text": "A newer story."}}),
+        "20260104-000000": json.dumps({"topic": {"text": ""}}),
+        "20260105-000000": json.dumps({"subtext": {"text": "No topic recorded."}}),
+        "20260106-000000": "{not json",
+        "20260107-000000": None,  # bundle without metadata.json
+    }
+    for name, metadata in bundles.items():
+        bundle_dir = output_dir / name
+        bundle_dir.mkdir(parents=True)
+        if metadata is not None:
+            (bundle_dir / "metadata.json").write_text(metadata)
+    (output_dir / "stray-file").write_text("not a bundle directory")
+
+    # Newest first; bundles without a usable topic are skipped; capped at
+    # max_recent_topics.
+    assert _recent_topics() == ["A newer story.", "An old story."]
 
 
 def test_generate_subtext(monkeypatch):
@@ -234,6 +275,17 @@ def test_generate_image_cloudflare(monkeypatch, image_api_calls):
     assert kwargs["json"] == {"prompt": "A fake image prompt."}
 
 
+def test_generate_image_cloudflare_reports_api_failure(monkeypatch):
+    payload = {"success": False, "errors": [{"code": 3040, "message": "Capacity exceeded"}]}
+    monkeypatch.setattr(
+        joke_generator.httpx, "post", lambda url, **kwargs: _FakeCloudflareResponse(payload)
+    )
+    monkeypatch.setattr(settings, "image_provider", "cloudflare")
+
+    with pytest.raises(RuntimeError, match="Image generation failed.*Capacity exceeded"):
+        generate_image(ImagePrompt(text="A fake image prompt."))
+
+
 def test_generate_image_google(monkeypatch):
     def model(messages: list, info: AgentInfo) -> ModelResponse:
         assert info.model_request_parameters.allow_image_output
@@ -299,6 +351,19 @@ def test_image_media_type_handles_any_pillow_format():
     assert image_media_type(buffer.getvalue()) == "image/webp"
 
 
+def test_image_media_type_rejects_formats_without_a_media_type():
+    # Pillow reads and writes QOI but registers no MIME type for it.
+    buffer = io.BytesIO()
+    Image.new("RGB", (4, 4), "gray").save(buffer, format="QOI")
+    with pytest.raises(ValueError, match="no known media type"):
+        image_media_type(buffer.getvalue())
+
+
+def test_response_image_requires_a_file_part():
+    with pytest.raises(ValueError, match="no image"):
+        response_image(ModelResponse(parts=[TextPart(content="No image here.")]))
+
+
 def test_compose_alt_text():
     assert (
         compose_alt_text("Aerial photo of a dam.", "A fake joke.")
@@ -323,22 +388,42 @@ def test_wrap_caption_wraps_to_width():
     assert " ".join(lines) == caption  # no words lost or reordered
 
 
-def test_recaption_rewrites_from_original_and_keeps_versions(tmp_path, capsys):
+def test_wrap_caption_of_blank_caption_has_no_lines():
+    font = ImageFont.load_default(size=24)
+    assert _wrap_caption("", font, 100) == []
+    assert _wrap_caption("   ", font, 100) == []
+
+
+class _FrozenDatetime:
+    """datetime stand-in whose clock never advances."""
+
+    @staticmethod
+    def now() -> datetime:
+        return datetime(2026, 1, 1, 12, 0, 0, 123456)
+
+
+def test_recaption_rewrites_from_original_and_keeps_versions(tmp_path, monkeypatch):
     bundle_dir = tmp_path / "20260101-000000"
     bundle_dir.mkdir()
     (bundle_dir / "image-original.jpg").write_bytes(FAKE_IMAGE_BYTES)
+    # Pin the clock so that every re-run lands in the same second.
+    monkeypatch.setattr(recaption, "datetime", _FrozenDatetime)
 
     # The first rewrite fills the pipeline's canonical file name; later
-    # rewrites get new datetime-stamped files — later stamps are newer.
+    # rewrites get new datetime-stamped files — later stamps are newer — and a
+    # same-second re-run falls back to a microsecond stamp rather than
+    # overwriting a retained version.
     recaption.main([str(bundle_dir), "A rewritten caption."])
     recaption.main([str(bundle_dir), "A second, much longer rewritten caption."])
     recaption.main([str(bundle_dir), "A third rewritten caption, longest of them all."])
 
-    stamped = sorted(bundle_dir.glob("image-captioned-*.jpg"))
-    assert len(stamped) == 2
-    versions = [(bundle_dir / "image-captioned.jpg").read_bytes()] + [
-        path.read_bytes() for path in stamped
-    ]
+    names = {path.name for path in bundle_dir.glob("image-captioned*.jpg")}
+    assert names == {
+        "image-captioned.jpg",
+        "image-captioned-20260101-120000.jpg",
+        "image-captioned-20260101-120000-123456.jpg",
+    }
+    versions = [(bundle_dir / name).read_bytes() for name in names]
 
     assert (bundle_dir / "image-original.jpg").read_bytes() == FAKE_IMAGE_BYTES
     assert len(set(versions)) == 3
@@ -487,31 +572,41 @@ _FAKE_IMAGE_RESPONSE = ModelResponse(
 )
 
 
-def _pipeline_model(messages: list, info: AgentInfo) -> ModelResponse:
-    """Play every direct-call step, told apart by their output schemas."""
-    if info.model_request_parameters.allow_image_output:
-        return _FAKE_IMAGE_RESPONSE
-    output_object = info.model_request_parameters.output_object
-    schema_name = output_object.name if output_object is not None else None
-    if schema_name == "Grade":
-        text = Grade(passed=True).model_dump_json()
-    elif schema_name == "Joke":
-        text = Joke(text="A fake joke.", rationale="Irony.").model_dump_json()
-    elif schema_name == "Subtext":
-        text = Subtext(text="A fake subtext.").model_dump_json()
-    elif schema_name == "ImagePrompt":
-        text = ImagePrompt(text="A fake image prompt.").model_dump_json()
-    elif schema_name == "ImageDescription":
-        text = ImageDescription(text="A gray rectangle.").model_dump_json()
-    elif schema_name == "Rephrasings":
-        text = Rephrasings(texts=["Alt one.", "Alt two."]).model_dump_json()
-    else:
-        raise AssertionError(f"Unexpected request schema: {schema_name}")
-    return ModelResponse(parts=[TextPart(content=text)])
+def _pipeline_model(
+    grade_for: Callable[[str], Grade] | None = None,
+) -> Callable[[list, AgentInfo], ModelResponse]:
+    """A FunctionModel function that plays every direct-call step, told apart
+    by their output schemas. Every evaluation gate passes unless `grade_for`
+    is given to pick the Grade from the evaluation prompt."""
+
+    def model(messages: list, info: AgentInfo) -> ModelResponse:
+        if info.model_request_parameters.allow_image_output:
+            return _FAKE_IMAGE_RESPONSE
+        output_object = info.model_request_parameters.output_object
+        schema_name = output_object.name if output_object is not None else None
+        if schema_name == "Grade":
+            prompt = messages[0].parts[0].content
+            grade = grade_for(prompt) if grade_for is not None else Grade(passed=True)
+            text = grade.model_dump_json()
+        elif schema_name == "Joke":
+            text = Joke(text="A fake joke.", rationale="Irony.").model_dump_json()
+        elif schema_name == "Subtext":
+            text = Subtext(text="A fake subtext.").model_dump_json()
+        elif schema_name == "ImagePrompt":
+            text = ImagePrompt(text="A fake image prompt.").model_dump_json()
+        elif schema_name == "ImageDescription":
+            text = ImageDescription(text="A gray rectangle.").model_dump_json()
+        elif schema_name == "Rephrasings":
+            text = Rephrasings(texts=["Alt one.", "Alt two."]).model_dump_json()
+        else:
+            raise AssertionError(f"Unexpected request schema: {schema_name}")
+        return ModelResponse(parts=[TextPart(content=text)])
+
+    return model
 
 
 def test_main_smoke(monkeypatch, tmp_path, log_output):
-    _set_all_step_models(monkeypatch, FunctionModel(_pipeline_model, profile=_PROFILE))
+    _set_all_step_models(monkeypatch, FunctionModel(_pipeline_model(), profile=_PROFILE))
     monkeypatch.setattr(settings, "output_dir", tmp_path / "output")
     with _find_topic_agent.override(model=canned_model("A fake topic."), native_tools=[]):
         joke_generator.main()
@@ -554,39 +649,57 @@ def test_main_smoke(monkeypatch, tmp_path, log_output):
     assert set(metadata["costs"]["total"]) == {"input_tokens", "output_tokens", "usd"}
 
 
-def test_main_retries_failed_joke_grading(monkeypatch, tmp_path, log_output):
+def test_main_retries_failed_joke_grading(monkeypatch, log_output):
     joke_grades = iter(
         [Grade(passed=False, feedback="* The funny part is not last."), Grade(passed=True)]
     )
 
-    def model(messages: list, info: AgentInfo) -> ModelResponse:
-        if info.model_request_parameters.allow_image_output:
-            return _FAKE_IMAGE_RESPONSE
-        content = messages[0].parts[0].content
-        output_object = info.model_request_parameters.output_object
-        schema_name = output_object.name if output_object is not None else None
-        if schema_name == "Grade":
-            grade = next(joke_grades) if "# Evaluate Joke" in content else Grade(passed=True)
-            text = grade.model_dump_json()
-        elif schema_name == "Joke":
-            text = Joke(text="A fake joke.", rationale="Irony.").model_dump_json()
-        elif schema_name == "Subtext":
-            text = Subtext(text="A fake subtext.").model_dump_json()
-        elif schema_name == "ImagePrompt":
-            text = ImagePrompt(text="A fake image prompt.").model_dump_json()
-        elif schema_name == "ImageDescription":
-            text = ImageDescription(text="A gray rectangle.").model_dump_json()
-        elif schema_name == "Rephrasings":
-            text = Rephrasings(texts=["Alt one.", "Alt two."]).model_dump_json()
-        else:
-            raise AssertionError(f"Unexpected request schema: {schema_name}")
-        return ModelResponse(parts=[TextPart(content=text)])
+    def grade_for(prompt: str) -> Grade:
+        return next(joke_grades) if "# Evaluate Joke" in prompt else Grade(passed=True)
 
-    _set_all_step_models(monkeypatch, FunctionModel(model, profile=_PROFILE))
-    monkeypatch.setattr(settings, "output_dir", tmp_path / "output")
+    _set_all_step_models(monkeypatch, FunctionModel(_pipeline_model(grade_for), profile=_PROFILE))
     with _find_topic_agent.override(model=canned_model("A fake topic."), native_tools=[]):
         joke_generator.main()
 
     out = "".join(log_output)
     assert "Joke failed grading (attempt 1):\n* The funny part is not last." in out
     assert "Joke: A fake joke." in out
+
+
+def test_main_retries_failed_subtext_grading(monkeypatch, log_output):
+    subtext_grades = iter(
+        [Grade(passed=False, feedback="* Not a simple sentence."), Grade(passed=True)]
+    )
+
+    def grade_for(prompt: str) -> Grade:
+        return next(subtext_grades) if "# Evaluate Subtext" in prompt else Grade(passed=True)
+
+    _set_all_step_models(monkeypatch, FunctionModel(_pipeline_model(grade_for), profile=_PROFILE))
+    with _find_topic_agent.override(model=canned_model("A fake topic."), native_tools=[]):
+        joke_generator.main()
+
+    out = "".join(log_output)
+    assert "Subtext failed grading (attempt 1):\n* Not a simple sentence." in out
+    assert "Subtext: A fake subtext." in out
+
+
+@pytest.mark.parametrize(
+    ("heading", "step"),
+    [("# Evaluate Subtext", "Subtext"), ("# Evaluate Joke", "Joke")],
+)
+def test_main_gives_up_after_max_grade_attempts(monkeypatch, log_output, heading, step):
+    monkeypatch.setattr(settings, "max_grade_attempts", 2)
+
+    def grade_for(prompt: str) -> Grade:
+        if heading in prompt:
+            return Grade(passed=False, feedback="* Still wrong.")
+        return Grade(passed=True)
+
+    _set_all_step_models(monkeypatch, FunctionModel(_pipeline_model(grade_for), profile=_PROFILE))
+    with _find_topic_agent.override(model=canned_model("A fake topic."), native_tools=[]):
+        with pytest.raises(RuntimeError, match=f"{step} failed grading after 2 attempts"):
+            joke_generator.main()
+
+    out = "".join(log_output)
+    assert f"{step} failed grading (attempt 1):\n* Still wrong." in out
+    assert f"{step} failed grading (attempt 2):\n* Still wrong." in out

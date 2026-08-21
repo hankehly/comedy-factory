@@ -1,12 +1,13 @@
 """Rendering a joke caption onto an image (workflow step 9)."""
 
 import io
+import math
 
 from PIL import Image, ImageDraw, ImageFont
 
 
 def _wrap_caption(
-    caption: str, font: ImageFont.FreeTypeFont, max_width: int
+    caption: str, font: ImageFont.FreeTypeFont | ImageFont.ImageFont, max_width: int
 ) -> list[str]:
     """Greedily wrap the caption into lines at most `max_width` pixels wide.
 
@@ -43,12 +44,10 @@ def render_caption(image: bytes, caption: str) -> bytes:
 
     draw = ImageDraw.Draw(base)
     bbox = draw.multiline_textbbox((0, 0), text, font=font, spacing=spacing)
+    # The bbox is float-typed; round the bar height up so no text is clipped.
+    text_height = math.ceil(bbox[3] - bbox[1])
 
-    canvas = Image.new(
-        "RGB",
-        (base.width, base.height + (bbox[3] - bbox[1]) + 2 * padding),
-        "white",
-    )
+    canvas = Image.new("RGB", (base.width, base.height + text_height + 2 * padding), "white")
     canvas.paste(base, (0, 0))
     ImageDraw.Draw(canvas).multiline_text(
         (

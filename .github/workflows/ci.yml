@@ -1,25 +1,43 @@
-name: CI
+name: ci
 
+# On every push (and on demand): the unit tests with their coverage gate, a
+# ruff lint pass, a mypy type-check, and a checkov scan of the workflows and
+# committed files. All the gates live in the repo config — coverage in
+# pyproject.toml ([tool.coverage.report] fail_under), ruff in [tool.ruff],
+# mypy in [tool.mypy], checkov in .checkov.yaml — so `just test` / `just lint`
+# / `just mypy` / `just checkov` locally and these jobs fail on exactly the
+# same conditions.
 on:
   push:
-    branches: [main]
-  pull_request:
+  workflow_dispatch:
+
+# A newer push to the same branch supersedes a run still in progress.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
 
 jobs:
   test:
+    name: pytest + coverage (100%)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
 
-      - uses: astral-sh/setup-uv@v7
+      - uses: astral-sh/setup-uv@v10.0.1  # no moving major tag past v7; pin the full version
         with:
           enable-cache: true
+          python-version: "3.12"  # keep in step with .python-version
 
-      - name: Install dependencies
+      - name: Install dependencies (locked)
         run: uv sync --locked
 
-      # Secret prompt files are gitignored; tests only need them to exist,
-      # so create them from their committed boilerplate templates.
+      # The secret prompt files are gitignored; the tests only need them to
+      # exist, so create them from their committed boilerplate templates
+      # (same as `just init-prompts`).
       - name: Create missing prompts from templates
         run: |
           for template in prompts/*.template.md; do
@@ -27,5 +45,67 @@ jobs:
             test -f "$target" || cp "$template" "$target"
           done
 
-      - name: Run tests
-        run: uv run pytest --cov=comedy_factory --cov-report=term-missing
+      # Same command as `just test`; coverage config (sources, branch mode,
+      # fail_under = 100) comes from pyproject.toml.
+      - name: Run tests with coverage
+        run: uv run pytest --cov --cov-report=term-missing
+
+  lint:
+    name: ruff check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: astral-sh/setup-uv@v10.0.1  # no moving major tag past v7; pin the full version
+        with:
+          enable-cache: true
+          python-version: "3.12"  # keep in step with .python-version
+
+      # Ruff comes from the dev dependency group; the project's runtime deps
+      # (pydantic-ai etc.) aren't needed to lint.
+      - name: Install dev dependencies (locked)
+        run: uv sync --locked --only-group dev
+
+      # Same check as `just lint`; rule selection and line length come from
+      # pyproject.toml [tool.ruff].
+      - name: Run ruff
+        run: uv run --no-sync ruff check .
+
+  mypy:
+    name: mypy
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: astral-sh/setup-uv@v10.0.1  # no moving major tag past v7; pin the full version
+        with:
+          enable-cache: true
+          python-version: "3.12"  # keep in step with .python-version
+
+      # Full dependency set: unlike ruff, mypy resolves types against the
+      # runtime libraries (pydantic-ai, Pillow, httpx) and its pydantic
+      # plugin imports pydantic.
+      - name: Install dependencies (locked)
+        run: uv sync --locked
+
+      # Same check as `just mypy`; the checked files and plugin come from
+      # pyproject.toml [tool.mypy].
+      - name: Run mypy
+        run: uv run --no-sync mypy
+
+  checkov:
+    name: checkov (workflows + secrets)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: astral-sh/setup-uv@v10.0.1  # no moving major tag past v7; pin the full version
+
+      # Same command as `just checkov`; frameworks, skip paths and output
+      # options come from .checkov.yaml. Version pinned here and in the
+      # justfile — bump both together.
+      - name: Run checkov
+        run: uvx checkov@3.3.11

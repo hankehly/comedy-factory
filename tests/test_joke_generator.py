@@ -4,8 +4,8 @@ Model stubbing follows pydantic-ai's recommended seams:
 
 * The scan-news Agent is swapped via `agent.override(model=...)`; its WebSearch
   native tool is overridden away because TestModel can't emulate built-in tools.
-* The direct-call steps read their per-step model setting (e.g.
-  `settings.generate_subtext_model`) at call time, so tests monkeypatch that
+* The other steps' agents read their model from the step's config (e.g.
+  `settings.generate_subtext.model`) at call time, so tests monkeypatch that
   attribute with a TestModel/FunctionModel instance.
 """
 
@@ -48,11 +48,14 @@ from comedy_factory.joke_generator import (
     write_image_prompt,
 )
 from comedy_factory.settings import settings
-from comedy_factory.utils import compose_alt_text, image_media_type, response_image
+from comedy_factory.utils import compose_alt_text, image_media_type
 
 # Grading uses output_mode="native" and image generation uses image output;
-# TestModel/FunctionModel default profiles reject both.
-_PROFILE = ModelProfile(supports_json_schema_output=True, supports_image_output=True)
+# TestModel/FunctionModel default profiles reject both. They also don't
+# support thinking, so pydantic-ai would strip the steps' `thinking` setting.
+_PROFILE = ModelProfile(
+    supports_json_schema_output=True, supports_image_output=True, supports_thinking=True
+)
 
 
 def canned_model(text: str) -> TestModel:
@@ -195,7 +198,7 @@ def test_recent_topics_skips_unreadable_bundles_and_caps_the_count(monkeypatch, 
 
 def test_generate_subtext(monkeypatch):
     canned = Subtext(text="A fake subtext.").model_dump_json()
-    monkeypatch.setattr(settings, "generate_subtext_model", canned_model(canned))
+    monkeypatch.setattr(settings.generate_subtext, "model", canned_model(canned))
     subtext, history, cost = generate_subtext("A fake topic.")
     assert subtext.text == "A fake subtext."
     assert len(history) == 2  # templated prompt + model response
@@ -204,7 +207,7 @@ def test_generate_subtext(monkeypatch):
 
 def test_generate_subtext_retry_extends_history(monkeypatch):
     canned = Subtext(text="A better subtext.").model_dump_json()
-    monkeypatch.setattr(settings, "generate_subtext_model", canned_model(canned))
+    monkeypatch.setattr(settings.generate_subtext, "model", canned_model(canned))
     _, history, _ = generate_subtext("A fake topic.")
     subtext, history, _ = generate_subtext(
         "A fake topic.", history=history, feedback="* Too wordy."
@@ -216,7 +219,7 @@ def test_generate_subtext_retry_extends_history(monkeypatch):
 
 def test_generate_joke(monkeypatch):
     canned = Joke(text="A fake joke.", rationale="Irony.").model_dump_json()
-    monkeypatch.setattr(settings, "generate_joke_model", canned_model(canned))
+    monkeypatch.setattr(settings.generate_joke, "model", canned_model(canned))
     joke, history, _ = generate_joke("A fake subtext.")
     assert joke.text == "A fake joke."
     assert joke.rationale == "Irony."
@@ -225,7 +228,7 @@ def test_generate_joke(monkeypatch):
 
 def test_write_image_prompt(monkeypatch):
     canned = ImagePrompt(text="A fake image prompt.").model_dump_json()
-    monkeypatch.setattr(settings, "write_image_prompt_model", canned_model(canned))
+    monkeypatch.setattr(settings.write_image_prompt, "model", canned_model(canned))
     joke = Joke(text="A fake joke.", rationale="Irony.")
     image_prompt, _ = write_image_prompt(joke)
     assert image_prompt.text == "A fake image prompt."
@@ -233,7 +236,7 @@ def test_write_image_prompt(monkeypatch):
 
 def test_rephrase_joke(monkeypatch):
     canned = Rephrasings(texts=["Alt one.", "Alt two."]).model_dump_json()
-    monkeypatch.setattr(settings, "rephrase_joke_model", canned_model(canned))
+    monkeypatch.setattr(settings.rephrase_joke, "model", canned_model(canned))
     rephrasings, _ = rephrase_joke(Joke(text="A fake joke.", rationale="Irony."))
     assert rephrasings.texts == ["Alt one.", "Alt two."]
 
@@ -248,7 +251,7 @@ def test_rephrase_joke_requests_configured_count(monkeypatch):
 
     monkeypatch.setattr(settings, "rephrasing_count", 5)
     monkeypatch.setattr(
-        settings, "rephrase_joke_model", FunctionModel(model, profile=_PROFILE)
+        settings.rephrase_joke, "model", FunctionModel(model, profile=_PROFILE)
     )
 
     rephrase_joke(Joke(text="A fake joke.", rationale="Irony."))
@@ -298,7 +301,7 @@ def test_generate_image_google(monkeypatch):
         )
 
     monkeypatch.setattr(settings, "image_provider", "google")
-    monkeypatch.setattr(settings, "google_image_model", FunctionModel(model, profile=_PROFILE))
+    monkeypatch.setattr(settings.google_image, "model", FunctionModel(model, profile=_PROFILE))
 
     image, _ = generate_image(ImagePrompt(text="A fake image prompt."))
     assert image == FAKE_IMAGE_BYTES
@@ -313,7 +316,7 @@ def test_describe_image_sends_image_to_model(monkeypatch):
         return ModelResponse(parts=[TextPart(content=text)])
 
     monkeypatch.setattr(
-        settings, "describe_image_model", FunctionModel(model, profile=_PROFILE)
+        settings.describe_image, "model", FunctionModel(model, profile=_PROFILE)
     )
 
     description, _ = describe_image(FAKE_IMAGE_BYTES)
@@ -334,7 +337,7 @@ def test_describe_image_detects_png(monkeypatch):
         return ModelResponse(parts=[TextPart(content=text)])
 
     monkeypatch.setattr(
-        settings, "describe_image_model", FunctionModel(model, profile=_PROFILE)
+        settings.describe_image, "model", FunctionModel(model, profile=_PROFILE)
     )
 
     buffer = io.BytesIO()
@@ -357,11 +360,6 @@ def test_image_media_type_rejects_formats_without_a_media_type():
     Image.new("RGB", (4, 4), "gray").save(buffer, format="QOI")
     with pytest.raises(ValueError, match="no known media type"):
         image_media_type(buffer.getvalue())
-
-
-def test_response_image_requires_a_file_part():
-    with pytest.raises(ValueError, match="no image"):
-        response_image(ModelResponse(parts=[TextPart(content="No image here.")]))
 
 
 def test_compose_alt_text():
@@ -464,7 +462,7 @@ def test_recaption_requires_original_image(tmp_path):
 
 def test_grade_subtext_pass(monkeypatch):
     canned = Grade(passed=True).model_dump_json()
-    monkeypatch.setattr(settings, "grade_subtext_model", canned_model(canned))
+    monkeypatch.setattr(settings.grade_subtext, "model", canned_model(canned))
     grade, _ = grade_subtext("A fake topic.", "A fake subtext.")
     assert grade.passed
     assert grade.feedback == ""
@@ -472,7 +470,7 @@ def test_grade_subtext_pass(monkeypatch):
 
 def test_grade_subtext_fail(monkeypatch):
     canned = Grade(passed=False, feedback="* Not a simple sentence.").model_dump_json()
-    monkeypatch.setattr(settings, "grade_subtext_model", canned_model(canned))
+    monkeypatch.setattr(settings.grade_subtext, "model", canned_model(canned))
     grade, _ = grade_subtext("A fake topic.", "A fake subtext.")
     assert not grade.passed
     assert grade.feedback == "* Not a simple sentence."
@@ -480,10 +478,31 @@ def test_grade_subtext_fail(monkeypatch):
 
 def test_grade_joke_fail(monkeypatch):
     canned = Grade(passed=False, feedback="* The funny part is not last.").model_dump_json()
-    monkeypatch.setattr(settings, "grade_joke_model", canned_model(canned))
+    monkeypatch.setattr(settings.grade_joke, "model", canned_model(canned))
     grade, _ = grade_joke("A fake subtext.", "A fake joke.")
     assert not grade.passed
     assert grade.feedback == "* The funny part is not last."
+
+
+def test_steps_send_their_configured_model_settings(monkeypatch):
+    seen = []
+
+    def model(messages: list, info: AgentInfo) -> ModelResponse:
+        seen.append(info)
+        return ModelResponse(parts=[TextPart(content=Grade(passed=True).model_dump_json())])
+
+    monkeypatch.setattr(settings.grade_joke, "model", FunctionModel(model, profile=_PROFILE))
+    monkeypatch.setattr(
+        settings.grade_joke, "model_settings", {"thinking": "low", "temperature": 0.0}
+    )
+
+    grade_joke("A fake subtext.", "A fake joke.")
+
+    [info] = seen
+    # pydantic-ai resolves the unified `thinking` setting into the request
+    # parameters; the remaining settings reach the model as given.
+    assert info.model_request_parameters.thinking == "low"
+    assert info.model_settings == {"temperature": 0.0}
 
 
 def test_step_cost_addition_sums_tokens_and_known_costs():
@@ -553,18 +572,18 @@ def test_save_asset(monkeypatch, tmp_path):
 
 
 def _set_all_step_models(monkeypatch, model):
-    """Point every direct-call step's model setting at the same stub."""
+    """Point every agent step's model (except find_topic's) at the same stub."""
     for name in (
-        "generate_subtext_model",
-        "grade_subtext_model",
-        "generate_joke_model",
-        "grade_joke_model",
-        "rephrase_joke_model",
-        "write_image_prompt_model",
-        "describe_image_model",
-        "google_image_model",
+        "generate_subtext",
+        "grade_subtext",
+        "generate_joke",
+        "grade_joke",
+        "rephrase_joke",
+        "write_image_prompt",
+        "describe_image",
+        "google_image",
     ):
-        monkeypatch.setattr(settings, name, model)
+        monkeypatch.setattr(getattr(settings, name), "model", model)
 
 
 _FAKE_IMAGE_RESPONSE = ModelResponse(
@@ -575,7 +594,7 @@ _FAKE_IMAGE_RESPONSE = ModelResponse(
 def _pipeline_model(
     grade_for: Callable[[str], Grade] | None = None,
 ) -> Callable[[list, AgentInfo], ModelResponse]:
-    """A FunctionModel function that plays every direct-call step, told apart
+    """A FunctionModel function that plays every agent step, told apart
     by their output schemas. Every evaluation gate passes unless `grade_for`
     is given to pick the Grade from the evaluation prompt."""
 
@@ -583,7 +602,7 @@ def _pipeline_model(
         if info.model_request_parameters.allow_image_output:
             return _FAKE_IMAGE_RESPONSE
         output_object = info.model_request_parameters.output_object
-        schema_name = output_object.name if output_object is not None else None
+        schema_name = output_object.json_schema["title"] if output_object is not None else None
         if schema_name == "Grade":
             prompt = messages[0].parts[0].content
             grade = grade_for(prompt) if grade_for is not None else Grade(passed=True)

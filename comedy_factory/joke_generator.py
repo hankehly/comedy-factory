@@ -54,34 +54,29 @@ import base64
 import json
 import re
 from collections import defaultdict
+from collections.abc import Sequence
 from datetime import datetime
 from pathlib import Path
+from typing import TypeVar
 
 import httpx
 from loguru import logger
 from pydantic import BaseModel, Field
-from pydantic_ai import Agent
+from pydantic_ai import Agent, AgentRunResult, NativeOutput
 from pydantic_ai.capabilities import WebSearch
-from pydantic_ai.direct import model_request_sync
 from pydantic_ai.messages import (
     BinaryImage,
     ModelMessage,
-    ModelRequest,
     ModelResponse,
-    UserPromptPart,
+    UserContent,
 )
-from pydantic_ai.models import ModelRequestParameters
-from pydantic_ai.output import OutputObjectDefinition
 
 from comedy_factory.captioning import render_caption
 from comedy_factory.prompts import load_prompt
-from comedy_factory.settings import settings
-from comedy_factory.utils import (
-    compose_alt_text,
-    image_media_type,
-    response_image,
-    response_text,
-)
+from comedy_factory.settings import StepConfig, settings
+from comedy_factory.utils import compose_alt_text, image_media_type
+
+OutputT = TypeVar("OutputT")
 
 
 class Grade(BaseModel):
@@ -138,22 +133,6 @@ class Joke(BaseModel):
     )
 
 
-# Finding a topic is a genuine agent step (search tool loop); the other LLM
-# steps are single model calls made directly via model_request_sync.
-_find_topic_agent = Agent(
-    settings.find_topic_model,
-    name="find_topic",
-    capabilities=[WebSearch()],
-)
-
-_grade_request_parameters = ModelRequestParameters(
-    output_mode="native",
-    output_object=OutputObjectDefinition(
-        name=Grade.__name__,
-        json_schema=Grade.model_json_schema(),
-    ),
-)
-
 class ImagePrompt(BaseModel):
     """A text-to-image prompt for the image that accompanies a joke."""
 
@@ -204,6 +183,20 @@ def _response_cost(response: ModelResponse) -> StepCost:
     )
 
 
+def _run_cost(result: AgentRunResult[object]) -> StepCost:
+    """Token usage and estimated cost of an agent run. A run may take several
+    model responses (a tool loop, an output-validation retry); sum them all,
+    leaving out the earlier turns passed in as message history."""
+    return sum(
+        (
+            _response_cost(message)
+            for message in result.new_messages()
+            if isinstance(message, ModelResponse)
+        ),
+        StepCost(),
+    )
+
+
 class Rephrasings(BaseModel):
     """Alternative phrasings of the approved joke, for human review and
     possible recaptioning."""
@@ -229,45 +222,38 @@ class ImageDescription(BaseModel):
     )
 
 
-_subtext_request_parameters = ModelRequestParameters(
-    output_mode="native",
-    output_object=OutputObjectDefinition(
-        name=Subtext.__name__,
-        json_schema=Subtext.model_json_schema(),
-    ),
+# One agent per LLM step. None is bound to a model: each run passes its
+# step's StepConfig from settings (see _run_step), so the model and model
+# settings are read at call time. Finding a topic is the one step that loops
+# (search tool); the rest answer in a single structured (native) response.
+_find_topic_agent = Agent(name="find_topic", capabilities=[WebSearch()])
+_generate_subtext_agent = Agent(name="generate_subtext", output_type=NativeOutput(Subtext))
+_grade_subtext_agent = Agent(name="grade_subtext", output_type=NativeOutput(Grade))
+_generate_joke_agent = Agent(name="generate_joke", output_type=NativeOutput(Joke))
+_grade_joke_agent = Agent(name="grade_joke", output_type=NativeOutput(Grade))
+_rephrase_joke_agent = Agent(name="rephrase_joke", output_type=NativeOutput(Rephrasings))
+_write_image_prompt_agent = Agent(
+    name="write_image_prompt", output_type=NativeOutput(ImagePrompt)
+)
+_google_image_agent = Agent(name="generate_image", output_type=BinaryImage)
+_describe_image_agent = Agent(
+    name="describe_image", output_type=NativeOutput(ImageDescription)
 )
 
-_joke_request_parameters = ModelRequestParameters(
-    output_mode="native",
-    output_object=OutputObjectDefinition(
-        name=Joke.__name__,
-        json_schema=Joke.model_json_schema(),
-    ),
-)
 
-_image_prompt_request_parameters = ModelRequestParameters(
-    output_mode="native",
-    output_object=OutputObjectDefinition(
-        name=ImagePrompt.__name__,
-        json_schema=ImagePrompt.model_json_schema(),
-    ),
-)
-
-_image_description_request_parameters = ModelRequestParameters(
-    output_mode="native",
-    output_object=OutputObjectDefinition(
-        name=ImageDescription.__name__,
-        json_schema=ImageDescription.model_json_schema(),
-    ),
-)
-
-_rephrasings_request_parameters = ModelRequestParameters(
-    output_mode="native",
-    output_object=OutputObjectDefinition(
-        name=Rephrasings.__name__,
-        json_schema=Rephrasings.model_json_schema(),
-    ),
-)
+def _run_step(
+    agent: Agent[None, OutputT],
+    step: StepConfig,
+    prompt: str | Sequence[UserContent],
+    message_history: list[ModelMessage] | None = None,
+) -> AgentRunResult[OutputT]:
+    """Run a step's agent with the step's configured model and settings."""
+    return agent.run_sync(
+        prompt,
+        model=step.model,
+        model_settings=step.model_settings,
+        message_history=message_history,
+    )
 
 
 def _recent_topics() -> list[str]:
@@ -300,16 +286,7 @@ def find_topic() -> tuple[Topic, StepCost]:
     recent = "\n".join(f"* {topic}" for topic in _recent_topics()) or "(none)"
     prompt = load_prompt("find-topic.md", RECENT_TOPICS=recent)
 
-    result = _find_topic_agent.run_sync(prompt)
-    # The agent may take several turns (search tool loop); sum them all.
-    cost = sum(
-        (
-            _response_cost(message)
-            for message in result.all_messages()
-            if isinstance(message, ModelResponse)
-        ),
-        StepCost(),
-    )
+    result = _run_step(_find_topic_agent, settings.find_topic, prompt)
 
     # The prompt demands the bare topic line followed by the source URL; strip
     # any numbering/bullets or extra lines that slip through anyway.
@@ -325,7 +302,7 @@ def find_topic() -> tuple[Topic, StepCost]:
 
     url_match = re.search(r"https?://\S+", result.output)
     topic = Topic(text=text, source_url=url_match.group() if url_match else None)
-    return topic, cost
+    return topic, _run_cost(result)
 
 
 def generate_subtext(
@@ -342,23 +319,13 @@ def generate_subtext(
     """
     if history is None:
         prompt = load_prompt("generate-subtext.md", TOPIC=topic)
-        history = [ModelRequest.user_text_prompt(prompt)]
-    if feedback:
-        history.append(
-            ModelRequest.user_text_prompt(
-                load_prompt("rewrite-with-feedback.md", FEEDBACK=feedback)
-            )
-        )
+    else:
+        prompt = load_prompt("rewrite-with-feedback.md", FEEDBACK=feedback)
 
-    response = model_request_sync(
-        settings.generate_subtext_model,
-        history,
-        model_request_parameters=_subtext_request_parameters,
+    result = _run_step(
+        _generate_subtext_agent, settings.generate_subtext, prompt, history
     )
-    history.append(response)
-
-    subtext = Subtext.model_validate_json(response_text(response))
-    return subtext, history, _response_cost(response)
+    return result.output, result.all_messages(), _run_cost(result)
 
 
 def generate_joke(
@@ -376,23 +343,11 @@ def generate_joke(
     """
     if history is None:
         prompt = load_prompt("generate-joke.md", SUBTEXT=subtext)
-        history = [ModelRequest.user_text_prompt(prompt)]
-    if feedback:
-        history.append(
-            ModelRequest.user_text_prompt(
-                load_prompt("rewrite-with-feedback.md", FEEDBACK=feedback)
-            )
-        )
+    else:
+        prompt = load_prompt("rewrite-with-feedback.md", FEEDBACK=feedback)
 
-    response = model_request_sync(
-        settings.generate_joke_model,
-        history,
-        model_request_parameters=_joke_request_parameters,
-    )
-    history.append(response)
-
-    joke = Joke.model_validate_json(response_text(response))
-    return joke, history, _response_cost(response)
+    result = _run_step(_generate_joke_agent, settings.generate_joke, prompt, history)
+    return result.output, result.all_messages(), _run_cost(result)
 
 
 def write_image_prompt(joke: Joke) -> tuple[ImagePrompt, StepCost]:
@@ -405,14 +360,8 @@ def write_image_prompt(joke: Joke) -> tuple[ImagePrompt, StepCost]:
         "write-image-prompt.md", JOKE=joke.text, RATIONALE=joke.rationale
     )
 
-    response = model_request_sync(
-        settings.write_image_prompt_model,
-        [ModelRequest.user_text_prompt(prompt)],
-        model_request_parameters=_image_prompt_request_parameters,
-    )
-
-    image_prompt = ImagePrompt.model_validate_json(response_text(response))
-    return image_prompt, _response_cost(response)
+    result = _run_step(_write_image_prompt_agent, settings.write_image_prompt, prompt)
+    return result.output, _run_cost(result)
 
 
 def rephrase_joke(joke: Joke) -> tuple[Rephrasings, StepCost]:
@@ -429,14 +378,8 @@ def rephrase_joke(joke: Joke) -> tuple[Rephrasings, StepCost]:
         N=settings.rephrasing_count,
     )
 
-    response = model_request_sync(
-        settings.rephrase_joke_model,
-        [ModelRequest.user_text_prompt(prompt)],
-        model_request_parameters=_rephrasings_request_parameters,
-    )
-
-    rephrasings = Rephrasings.model_validate_json(response_text(response))
-    return rephrasings, _response_cost(response)
+    result = _run_step(_rephrase_joke_agent, settings.rephrase_joke, prompt)
+    return result.output, _run_cost(result)
 
 
 def generate_image(image_prompt: ImagePrompt) -> tuple[bytes, StepCost]:
@@ -449,12 +392,8 @@ def generate_image(image_prompt: ImagePrompt) -> tuple[bytes, StepCost]:
 
 def _generate_image_google(image_prompt: ImagePrompt) -> tuple[bytes, StepCost]:
     """Generate the image with a Gemini image model ("Nano Banana")."""
-    response = model_request_sync(
-        settings.google_image_model,
-        [ModelRequest.user_text_prompt(image_prompt.text)],
-        model_request_parameters=ModelRequestParameters(allow_image_output=True),
-    )
-    return response_image(response), _response_cost(response)
+    result = _run_step(_google_image_agent, settings.google_image, image_prompt.text)
+    return result.output.data, _run_cost(result)
 
 
 def _generate_image_cloudflare(image_prompt: ImagePrompt) -> tuple[bytes, StepCost]:
@@ -485,53 +424,28 @@ def describe_image(image: bytes) -> tuple[ImageDescription, StepCost]:
     """
     prompt = load_prompt("describe-image.md")
 
-    response = model_request_sync(
-        settings.describe_image_model,
-        [
-            ModelRequest(
-                parts=[
-                    UserPromptPart(
-                        content=[
-                            prompt,
-                            BinaryImage(
-                                data=image, media_type=image_media_type(image)
-                            ),
-                        ]
-                    )
-                ]
-            )
-        ],
-        model_request_parameters=_image_description_request_parameters,
+    result = _run_step(
+        _describe_image_agent,
+        settings.describe_image,
+        [prompt, BinaryImage(data=image, media_type=image_media_type(image))],
     )
-
-    image_description = ImageDescription.model_validate_json(response_text(response))
-    return image_description, _response_cost(response)
+    return result.output, _run_cost(result)
 
 
 def grade_subtext(topic: str, subtext: str) -> tuple[Grade, StepCost]:
     """Evaluate a subtext against the rules; a fail comes with feedback."""
     prompt = load_prompt("evaluate-subtext.md", TOPIC=topic, SUBTEXT=subtext)
 
-    response = model_request_sync(
-        settings.grade_subtext_model,
-        [ModelRequest.user_text_prompt(prompt)],
-        model_request_parameters=_grade_request_parameters,
-    )
-
-    return Grade.model_validate_json(response_text(response)), _response_cost(response)
+    result = _run_step(_grade_subtext_agent, settings.grade_subtext, prompt)
+    return result.output, _run_cost(result)
 
 
 def grade_joke(subtext: str, joke: str) -> tuple[Grade, StepCost]:
     """Evaluate a joke against the rules; a fail comes with feedback."""
     prompt = load_prompt("evaluate-joke.md", SUBTEXT=subtext, JOKE=joke)
 
-    response = model_request_sync(
-        settings.grade_joke_model,
-        [ModelRequest.user_text_prompt(prompt)],
-        model_request_parameters=_grade_request_parameters,
-    )
-
-    return Grade.model_validate_json(response_text(response)), _response_cost(response)
+    result = _run_step(_grade_joke_agent, settings.grade_joke, prompt)
+    return result.output, _run_cost(result)
 
 
 def grade_asset(

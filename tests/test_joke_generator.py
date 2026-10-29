@@ -17,7 +17,9 @@ from datetime import datetime
 
 import pytest
 from PIL import Image, ImageFont
+from pydantic_ai import NativeOutput, PromptedOutput
 from pydantic_ai.messages import BinaryImage, FilePart, ModelResponse, TextPart
+from pydantic_ai.models import infer_model
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.models.test import TestModel
 from pydantic_ai.profiles import ModelProfile
@@ -34,6 +36,7 @@ from comedy_factory.joke_generator import (
     Subtext,
     Topic,
     _find_topic_agent,
+    _output_spec,
     _recent_topics,
     describe_image,
     find_topic,
@@ -503,6 +506,41 @@ def test_steps_send_their_configured_model_settings(monkeypatch):
     # parameters; the remaining settings reach the model as given.
     assert info.model_request_parameters.thinking == "low"
     assert info.model_settings == {"temperature": 0.0}
+
+
+def test_structured_steps_fall_back_to_prompted_output(monkeypatch):
+    seen = []
+
+    def model(messages: list, info: AgentInfo) -> ModelResponse:
+        seen.append(info)
+        return ModelResponse(parts=[TextPart(content=Grade(passed=True).model_dump_json())])
+
+    # A model without native (JSON-schema) output support, like Claude Haiku.
+    profile = ModelProfile(supports_json_schema_output=False)
+    monkeypatch.setattr(settings.grade_joke, "model", FunctionModel(model, profile=profile))
+
+    grade, _ = grade_joke("A fake subtext.", "A fake joke.")
+
+    assert grade.passed
+    [info] = seen
+    assert info.model_request_parameters.output_mode == "prompted"
+
+
+@pytest.mark.parametrize(
+    ("model_name", "spec_type"),
+    [
+        ("anthropic:claude-sonnet-5-5", NativeOutput),
+        ("anthropic:claude-opus-5-5", NativeOutput),
+        ("anthropic:claude-haiku-5-5", PromptedOutput),
+    ],
+)
+def test_structured_output_mode_follows_claude_model_profiles(
+    monkeypatch, model_name, spec_type
+):
+    # Building the model needs a key; no request is made.
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-api-key")
+    spec = _output_spec(Subtext, infer_model(model_name))
+    assert isinstance(spec, spec_type)
 
 
 def test_step_cost_addition_sums_tokens_and_known_costs():

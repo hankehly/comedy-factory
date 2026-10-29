@@ -19,7 +19,14 @@ class StepModelSettings(ModelSettings, total=False):
 
 
 class StepConfig(BaseModel):
-    """The model and model settings one pipeline step's LLM calls use."""
+    """The model and model settings one pipeline step's LLM calls use.
+
+    `model` is any pydantic-ai model string: `google-cloud:` models go through
+    Vertex AI, `anthropic:` models (e.g. anthropic:claude-sonnet-5-5) through
+    the Anthropic API and need ANTHROPIC_API_KEY. Claude Sonnet/Opus 5.5
+    reject sampling settings (`temperature`, `top_p`); pydantic-ai drops them
+    with a warning.
+    """
 
     model: str = "google-cloud:gemini-3.5-flash"
     model_settings: StepModelSettings = Field(default_factory=StepModelSettings)
@@ -36,7 +43,8 @@ class Settings(BaseSettings):
     )
 
     # Thinking effort per step. Gemini 3 models think by default, and
-    # `thinking=False` turns them down to minimal rather than fully off.
+    # `thinking=False` turns them down to minimal rather than fully off;
+    # Claude models apply the same effort levels.
     find_topic: StepConfig = StepConfig()
     generate_subtext: StepConfig = StepConfig(model_settings={"thinking": "medium"})
     grade_subtext: StepConfig = StepConfig(model_settings={"thinking": "medium"})

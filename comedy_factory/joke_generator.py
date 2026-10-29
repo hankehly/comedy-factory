@@ -57,12 +57,12 @@ from collections import defaultdict
 from collections.abc import Sequence
 from datetime import datetime
 from pathlib import Path
-from typing import TypeVar
+from typing import TypeVar, cast
 
 import httpx
 from loguru import logger
 from pydantic import BaseModel, Field
-from pydantic_ai import Agent, AgentRunResult, NativeOutput
+from pydantic_ai import Agent, AgentRunResult, NativeOutput, PromptedOutput
 from pydantic_ai.capabilities import WebSearch
 from pydantic_ai.messages import (
     BinaryImage,
@@ -70,6 +70,8 @@ from pydantic_ai.messages import (
     ModelResponse,
     UserContent,
 )
+from pydantic_ai.models import Model, infer_model
+from pydantic_ai.output import OutputSpec
 
 from comedy_factory.captioning import render_caption
 from comedy_factory.prompts import load_prompt
@@ -225,20 +227,16 @@ class ImageDescription(BaseModel):
 # One agent per LLM step. None is bound to a model: each run passes its
 # step's StepConfig from settings (see _run_step), so the model and model
 # settings are read at call time. Finding a topic is the one step that loops
-# (search tool); the rest answer in a single structured (native) response.
+# (search tool); the rest answer in a single structured response.
 _find_topic_agent = Agent(name="find_topic", capabilities=[WebSearch()])
-_generate_subtext_agent = Agent(name="generate_subtext", output_type=NativeOutput(Subtext))
-_grade_subtext_agent = Agent(name="grade_subtext", output_type=NativeOutput(Grade))
-_generate_joke_agent = Agent(name="generate_joke", output_type=NativeOutput(Joke))
-_grade_joke_agent = Agent(name="grade_joke", output_type=NativeOutput(Grade))
-_rephrase_joke_agent = Agent(name="rephrase_joke", output_type=NativeOutput(Rephrasings))
-_write_image_prompt_agent = Agent(
-    name="write_image_prompt", output_type=NativeOutput(ImagePrompt)
-)
+_generate_subtext_agent = Agent(name="generate_subtext", output_type=Subtext)
+_grade_subtext_agent = Agent(name="grade_subtext", output_type=Grade)
+_generate_joke_agent = Agent(name="generate_joke", output_type=Joke)
+_grade_joke_agent = Agent(name="grade_joke", output_type=Grade)
+_rephrase_joke_agent = Agent(name="rephrase_joke", output_type=Rephrasings)
+_write_image_prompt_agent = Agent(name="write_image_prompt", output_type=ImagePrompt)
 _google_image_agent = Agent(name="generate_image", output_type=BinaryImage)
-_describe_image_agent = Agent(
-    name="describe_image", output_type=NativeOutput(ImageDescription)
-)
+_describe_image_agent = Agent(name="describe_image", output_type=ImageDescription)
 
 
 def _run_step(
@@ -248,12 +246,30 @@ def _run_step(
     message_history: list[ModelMessage] | None = None,
 ) -> AgentRunResult[OutputT]:
     """Run a step's agent with the step's configured model and settings."""
+    model = infer_model(step.model)
     return agent.run_sync(
         prompt,
-        model=step.model,
+        model=model,
         model_settings=step.model_settings,
         message_history=message_history,
+        output_type=_output_spec(agent.output_type, model),
     )
+
+
+def _output_spec(output_type: OutputSpec[OutputT], model: Model) -> OutputSpec[OutputT]:
+    """How the model should return a step's structured output: natively
+    (JSON-schema constrained) where it supports that, as with Gemini and
+    Claude Sonnet/Opus, otherwise with the schema in the prompt (e.g. Claude
+    Haiku). Tool-call output is avoided: Anthropic rejects forced tool use
+    while thinking is enabled. Non-structured outputs pass through as is."""
+    # Narrowing a separate name keeps `output_type`'s declared type intact for
+    # the passthrough return; mypy can't carry OutputT through issubclass().
+    candidate: object = output_type
+    if isinstance(candidate, type) and issubclass(candidate, BaseModel):
+        native = model.profile.get("supports_json_schema_output", False)
+        wrapper = NativeOutput if native else PromptedOutput
+        return cast(OutputSpec[OutputT], wrapper(candidate))
+    return output_type
 
 
 def _recent_topics() -> list[str]:

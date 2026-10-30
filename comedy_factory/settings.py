@@ -1,14 +1,18 @@
 """Shared settings for the comedy factory workflows."""
 
 import os
+from collections.abc import Mapping
 from pathlib import Path
+from typing import Any
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+_ENV_PREFIX = "COMEDY_FACTORY_"
+
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_prefix="COMEDY_FACTORY_")
+    model_config = SettingsConfigDict(env_prefix=_ENV_PREFIX)
 
     # The agent version each pipeline step runs: a committed file at
     # agents/<step>/<version>.yaml holding the step's model and model settings
@@ -43,6 +47,51 @@ class Settings(BaseSettings):
     # convention.
     cloudflare_account_id: str = Field("", validation_alias="CLOUDFLARE_ACCOUNT_ID")
     cloudflare_api_token: str = Field("", validation_alias="CLOUDFLARE_API_TOKEN")
+
+    def model_post_init(self, context: Any, /) -> None:
+        super().model_post_init(context)
+        check_env(os.environ)
+
+
+def check_env(environ: Mapping[str, str]) -> None:
+    """Fail on COMEDY_FACTORY_* environment variables that match no setting.
+
+    pydantic-settings ignores them, so a misspelled override, or a variable
+    from before agent versions, would otherwise quietly run on the defaults.
+    Names compare case-insensitively, as pydantic-settings matches them.
+    """
+    valid = {
+        f"{_ENV_PREFIX}{name}".upper()
+        for name, field in Settings.model_fields.items()
+        if field.validation_alias is None
+    }
+    unknown = sorted(
+        name
+        for name in environ
+        if name.upper().startswith(_ENV_PREFIX) and name.upper() not in valid
+    )
+    if unknown:
+        raise ValueError(
+            f"Unknown {_ENV_PREFIX}* environment variables (no such setting):\n"
+            + "\n".join(f"  {name}{_replacement_hint(name)}" for name in unknown)
+        )
+
+
+def _replacement_hint(name: str) -> str:
+    """For a variable that set a step's model before agent versions, the
+    version override that replaces it."""
+    rest = name.upper().removeprefix(_ENV_PREFIX)
+    if rest in {"IMAGE_PROVIDER", "CLOUDFLARE_IMAGE_MODEL", "GOOGLE_IMAGE_MODEL"} or (
+        rest.startswith("GOOGLE_IMAGE__")
+    ):
+        return f" (removed; pick an image version with {_ENV_PREFIX}GENERATE_IMAGE_AGENT)"
+    for field_name in Settings.model_fields:
+        step = field_name.removesuffix("_agent").upper()
+        if field_name.endswith("_agent") and (
+            rest == f"{step}_MODEL" or rest.startswith(f"{step}__")
+        ):
+            return f" (removed; pick a version with {_ENV_PREFIX}{step}_AGENT)"
+    return ""
 
 
 settings = Settings()

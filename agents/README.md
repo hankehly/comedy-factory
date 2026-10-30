@@ -42,9 +42,11 @@ settings only ever come from files in this folder.
 
 ## Checks
 
-- **At startup**, the pipeline loads every selected version before its first
-  model call. An unknown version name fails with the list of versions that
-  exist. Each file must also pass these checks:
+- **At startup**, any `COMEDY_FACTORY_*` environment variable that isn't a
+  setting stops the run, so a misspelled override can't be silently ignored.
+  The pipeline then loads every selected version before its first model call.
+  An unknown version name fails with the list of versions that exist. Each
+  file must also pass these checks:
   - valid YAML, holding only `model` and `model_settings`
   - values that match the schema, so `thinking: hgh` fails
   - setting keys that pydantic-ai defines for the model's provider, so

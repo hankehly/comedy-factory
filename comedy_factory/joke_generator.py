@@ -73,9 +73,10 @@ from pydantic_ai.messages import (
 from pydantic_ai.models import Model, infer_model
 from pydantic_ai.output import OutputSpec
 
+from comedy_factory.agent_versions import CLOUDFLARE_PREFIX, AgentVersion, selected_versions
 from comedy_factory.captioning import render_caption
 from comedy_factory.prompts import load_prompt
-from comedy_factory.settings import StepConfig, settings
+from comedy_factory.settings import settings
 from comedy_factory.utils import compose_alt_text, image_media_type
 
 OutputT = TypeVar("OutputT")
@@ -224,9 +225,9 @@ class ImageDescription(BaseModel):
     )
 
 
-# One agent per LLM step. None is bound to a model: each run passes its
-# step's StepConfig from settings (see _run_step), so the model and model
-# settings are read at call time. Finding a topic is the one step that loops
+# One agent per LLM step. None is bound to a model: each run is handed its
+# step's agent version (see _run_step and agent_versions.py), which supplies
+# the model and model settings. Finding a topic is the one step that loops
 # (search tool); the rest answer in a single structured response.
 _find_topic_agent = Agent(name="find_topic", capabilities=[WebSearch()])
 _generate_subtext_agent = Agent(name="generate_subtext", output_type=Subtext)
@@ -241,16 +242,17 @@ _describe_image_agent = Agent(name="describe_image", output_type=ImageDescriptio
 
 def _run_step(
     agent: Agent[None, OutputT],
-    step: StepConfig,
+    version: AgentVersion,
     prompt: str | Sequence[UserContent],
     message_history: list[ModelMessage] | None = None,
 ) -> AgentRunResult[OutputT]:
-    """Run a step's agent with the step's configured model and settings."""
-    model = infer_model(step.model)
+    """Run a step's agent on one of its versions: the version's model, with
+    the version applied as a run-time agent spec for its model settings."""
+    model = infer_model(version.model)
     return agent.run_sync(
         prompt,
         model=model,
-        model_settings=step.model_settings,
+        spec=version.spec,
         message_history=message_history,
         output_type=_output_spec(agent.output_type, model),
     )
@@ -294,7 +296,7 @@ def _recent_topics() -> list[str]:
     return topics
 
 
-def find_topic() -> tuple[Topic, StepCost]:
+def find_topic(*, version: AgentVersion) -> tuple[Topic, StepCost]:
     """Return a factual news topic suitable for joke writing, with its source
     URL when the model provides one, along with the step's usage and cost.
     Topics of recent asset bundles are passed to the model as stories to
@@ -302,7 +304,7 @@ def find_topic() -> tuple[Topic, StepCost]:
     recent = "\n".join(f"* {topic}" for topic in _recent_topics()) or "(none)"
     prompt = load_prompt("find-topic.md", RECENT_TOPICS=recent)
 
-    result = _run_step(_find_topic_agent, settings.find_topic, prompt)
+    result = _run_step(_find_topic_agent, version, prompt)
 
     # The prompt demands the bare topic line followed by the source URL; strip
     # any numbering/bullets or extra lines that slip through anyway.
@@ -325,6 +327,8 @@ def generate_subtext(
     topic: str,
     history: list[ModelMessage] | None = None,
     feedback: str | None = None,
+    *,
+    version: AgentVersion,
 ) -> tuple[Subtext, list[ModelMessage], StepCost]:
     """Return a subtext — the writer's opinion about a news topic — the
     conversation history that produced it, and the call's usage and cost.
@@ -338,9 +342,7 @@ def generate_subtext(
     else:
         prompt = load_prompt("rewrite-with-feedback.md", FEEDBACK=feedback)
 
-    result = _run_step(
-        _generate_subtext_agent, settings.generate_subtext, prompt, history
-    )
+    result = _run_step(_generate_subtext_agent, version, prompt, history)
     return result.output, result.all_messages(), _run_cost(result)
 
 
@@ -348,6 +350,8 @@ def generate_joke(
     subtext: str,
     history: list[ModelMessage] | None = None,
     feedback: str | None = None,
+    *,
+    version: AgentVersion,
 ) -> tuple[Joke, list[ModelMessage], StepCost]:
     """Return a joke communicating the subtext — along with the rationale
     behind its construction — the conversation history that produced it, and
@@ -362,11 +366,11 @@ def generate_joke(
     else:
         prompt = load_prompt("rewrite-with-feedback.md", FEEDBACK=feedback)
 
-    result = _run_step(_generate_joke_agent, settings.generate_joke, prompt, history)
+    result = _run_step(_generate_joke_agent, version, prompt, history)
     return result.output, result.all_messages(), _run_cost(result)
 
 
-def write_image_prompt(joke: Joke) -> tuple[ImagePrompt, StepCost]:
+def write_image_prompt(joke: Joke, *, version: AgentVersion) -> tuple[ImagePrompt, StepCost]:
     """Return a text-to-image prompt for the image that accompanies the joke,
     along with the call's usage and cost.
 
@@ -376,11 +380,11 @@ def write_image_prompt(joke: Joke) -> tuple[ImagePrompt, StepCost]:
         "write-image-prompt.md", JOKE=joke.text, RATIONALE=joke.rationale
     )
 
-    result = _run_step(_write_image_prompt_agent, settings.write_image_prompt, prompt)
+    result = _run_step(_write_image_prompt_agent, version, prompt)
     return result.output, _run_cost(result)
 
 
-def rephrase_joke(joke: Joke) -> tuple[Rephrasings, StepCost]:
+def rephrase_joke(joke: Joke, *, version: AgentVersion) -> tuple[Rephrasings, StepCost]:
     """Return alternative phrasings of the approved joke for human review,
     along with the call's usage and cost.
 
@@ -394,29 +398,34 @@ def rephrase_joke(joke: Joke) -> tuple[Rephrasings, StepCost]:
         N=settings.rephrasing_count,
     )
 
-    result = _run_step(_rephrase_joke_agent, settings.rephrase_joke, prompt)
+    result = _run_step(_rephrase_joke_agent, version, prompt)
     return result.output, _run_cost(result)
 
 
-def generate_image(image_prompt: ImagePrompt) -> tuple[bytes, StepCost]:
-    """Render the image prompt with the configured image provider; returns the
-    image bytes and the call's usage and cost."""
-    if settings.image_provider == "cloudflare":
-        return _generate_image_cloudflare(image_prompt)
-    return _generate_image_google(image_prompt)
+def generate_image(image_prompt: ImagePrompt, *, version: AgentVersion) -> tuple[bytes, StepCost]:
+    """Render the image prompt with the version's image model, a Cloudflare
+    Workers AI model for a cloudflare: version and a pydantic-ai one otherwise;
+    returns the image bytes and the call's usage and cost."""
+    if version.model.startswith(CLOUDFLARE_PREFIX):
+        return _generate_image_cloudflare(
+            image_prompt, version.model.removeprefix(CLOUDFLARE_PREFIX)
+        )
+    return _generate_image_google(image_prompt, version)
 
 
-def _generate_image_google(image_prompt: ImagePrompt) -> tuple[bytes, StepCost]:
+def _generate_image_google(
+    image_prompt: ImagePrompt, version: AgentVersion
+) -> tuple[bytes, StepCost]:
     """Generate the image with a Gemini image model ("Nano Banana")."""
-    result = _run_step(_google_image_agent, settings.google_image, image_prompt.text)
+    result = _run_step(_google_image_agent, version, image_prompt.text)
     return result.output.data, _run_cost(result)
 
 
-def _generate_image_cloudflare(image_prompt: ImagePrompt) -> tuple[bytes, StepCost]:
-    """Generate the image with FLUX on Cloudflare Workers AI."""
+def _generate_image_cloudflare(image_prompt: ImagePrompt, model: str) -> tuple[bytes, StepCost]:
+    """Generate the image with a Cloudflare Workers AI model, such as FLUX."""
     response = httpx.post(
         "https://api.cloudflare.com/client/v4/accounts/"
-        f"{settings.cloudflare_account_id}/ai/run/{settings.cloudflare_image_model}",
+        f"{settings.cloudflare_account_id}/ai/run/{model}",
         headers={"Authorization": f"Bearer {settings.cloudflare_api_token}"},
         json={"prompt": image_prompt.text},
         timeout=60,
@@ -430,7 +439,7 @@ def _generate_image_cloudflare(image_prompt: ImagePrompt) -> tuple[bytes, StepCo
     return base64.b64decode(payload["result"]["image"]), StepCost()
 
 
-def describe_image(image: bytes) -> tuple[ImageDescription, StepCost]:
+def describe_image(image: bytes, *, version: AgentVersion) -> tuple[ImageDescription, StepCost]:
     """Return a factual visual description of the generated image, along with
     the call's usage and cost.
 
@@ -442,25 +451,25 @@ def describe_image(image: bytes) -> tuple[ImageDescription, StepCost]:
 
     result = _run_step(
         _describe_image_agent,
-        settings.describe_image,
+        version,
         [prompt, BinaryImage(data=image, media_type=image_media_type(image))],
     )
     return result.output, _run_cost(result)
 
 
-def grade_subtext(topic: str, subtext: str) -> tuple[Grade, StepCost]:
+def grade_subtext(topic: str, subtext: str, *, version: AgentVersion) -> tuple[Grade, StepCost]:
     """Evaluate a subtext against the rules; a fail comes with feedback."""
     prompt = load_prompt("evaluate-subtext.md", TOPIC=topic, SUBTEXT=subtext)
 
-    result = _run_step(_grade_subtext_agent, settings.grade_subtext, prompt)
+    result = _run_step(_grade_subtext_agent, version, prompt)
     return result.output, _run_cost(result)
 
 
-def grade_joke(subtext: str, joke: str) -> tuple[Grade, StepCost]:
+def grade_joke(subtext: str, joke: str, *, version: AgentVersion) -> tuple[Grade, StepCost]:
     """Evaluate a joke against the rules; a fail comes with feedback."""
     prompt = load_prompt("evaluate-joke.md", SUBTEXT=subtext, JOKE=joke)
 
-    result = _run_step(_grade_joke_agent, settings.grade_joke, prompt)
+    result = _run_step(_grade_joke_agent, version, prompt)
     return result.output, _run_cost(result)
 
 
@@ -492,6 +501,7 @@ def save_asset(
     image_description: ImageDescription,
     costs: dict[str, StepCost],
     evaluation: Grade,
+    versions: dict[str, AgentVersion],
 ) -> Path:
     """Write the run's artifacts to a timestamped directory; returns its path."""
     created_at = datetime.now()
@@ -515,6 +525,7 @@ def save_asset(
         "image_description": image_description.model_dump(),
         "alt_text": compose_alt_text(image_description.text, joke.text),
         "evaluation": evaluation.model_dump(),
+        "agents": {step: version.as_metadata() for step, version in versions.items()},
         "costs": {
             "steps": {step: cost.model_dump() for step, cost in costs.items()},
             "total": sum(costs.values(), StepCost()).model_dump(),
@@ -527,9 +538,12 @@ def save_asset(
 
 def main():
     """Execute the joke generator workflow."""
+    # Load and check every step's agent version first, so a bad selection
+    # fails before any model call is paid for.
+    versions = selected_versions()
     costs: defaultdict[str, StepCost] = defaultdict(StepCost)
 
-    topic, cost = find_topic()
+    topic, cost = find_topic(version=versions["find_topic"])
     costs["find_topic"] += cost
     logger.info(f"Topic: {topic.text}")
     logger.info(f"Source: {topic.source_url}")
@@ -537,9 +551,13 @@ def main():
     history = None
     feedback = None
     for attempt in range(1, settings.max_grade_attempts + 1):
-        subtext, history, cost = generate_subtext(topic.text, history, feedback)
+        subtext, history, cost = generate_subtext(
+            topic.text, history, feedback, version=versions["generate_subtext"]
+        )
         costs["generate_subtext"] += cost
-        grade, cost = grade_subtext(topic.text, subtext.text)
+        grade, cost = grade_subtext(
+            topic.text, subtext.text, version=versions["grade_subtext"]
+        )
         costs["grade_subtext"] += cost
         if grade.passed:
             break
@@ -554,9 +572,11 @@ def main():
     history = None
     feedback = None
     for attempt in range(1, settings.max_grade_attempts + 1):
-        joke, history, cost = generate_joke(subtext.text, history, feedback)
+        joke, history, cost = generate_joke(
+            subtext.text, history, feedback, version=versions["generate_joke"]
+        )
         costs["generate_joke"] += cost
-        grade, cost = grade_joke(subtext.text, joke.text)
+        grade, cost = grade_joke(subtext.text, joke.text, version=versions["grade_joke"])
         costs["grade_joke"] += cost
         if grade.passed:
             break
@@ -569,21 +589,21 @@ def main():
     logger.info(f"Joke: {joke.text}")
     logger.info(f"Rationale: {joke.rationale}")
 
-    rephrasings, cost = rephrase_joke(joke)
+    rephrasings, cost = rephrase_joke(joke, version=versions["rephrase_joke"])
     costs["rephrase_joke"] += cost
     for index, text in enumerate(rephrasings.texts, 1):
         logger.info(f"Rephrasing {index}: {text}")
 
-    image_prompt, cost = write_image_prompt(joke)
+    image_prompt, cost = write_image_prompt(joke, version=versions["write_image_prompt"])
     costs["write_image_prompt"] += cost
     logger.info(f"Image prompt: {image_prompt.text}")
 
-    image, cost = generate_image(image_prompt)
+    image, cost = generate_image(image_prompt, version=versions["generate_image"])
     costs["generate_image"] += cost
     captioned = render_caption(image, joke.text)
     rephrased_images = [render_caption(image, text) for text in rephrasings.texts]
 
-    image_description, cost = describe_image(image)
+    image_description, cost = describe_image(image, version=versions["describe_image"])
     costs["describe_image"] += cost
     logger.info(f"Alt text: {compose_alt_text(image_description.text, joke.text)}")
 
@@ -607,6 +627,7 @@ def main():
         image_description,
         dict(costs),
         evaluation,
+        versions,
     )
     logger.info(f"Asset bundle saved to {bundle_dir}")
 

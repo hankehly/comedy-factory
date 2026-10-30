@@ -107,6 +107,12 @@ def load_version(step: str, name: str) -> AgentVersion:
     return AgentVersion(step, name, check_version_file(step, path))
 
 
+def selected_versions() -> dict[str, AgentVersion]:
+    """The version each step is set to run (`<step>_agent` settings), loaded
+    and checked, so a bad selection fails before any model is called."""
+    return {step: load_version(step, getattr(settings, f"{step}_agent")) for step in STEPS}
+
+
 def check_version_file(step: str, path: Path) -> AgentSpec:
     """Check a version file of `step` and return its spec. The first problem
     found raises AgentVersionError naming the step, version and file."""

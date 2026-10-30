@@ -1,0 +1,2 @@
+# yaml-language-server: $schema=../agent-spec.schema.json
+model: cloudflare:@cf/black-forest-labs/flux-1-schnell

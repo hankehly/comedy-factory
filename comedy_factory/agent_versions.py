@@ -2,6 +2,7 @@
 can run. A version is one pydantic-ai agent spec file holding a model and its
 model settings, at agents/<step>/<version>.yaml (see agents/README.md)."""
 
+import json
 from dataclasses import dataclass
 from functools import cache
 from pathlib import Path
@@ -34,6 +35,10 @@ STEPS: tuple[str, ...] = (
 CLOUDFLARE_PREFIX = "cloudflare:"
 """Prefix of Cloudflare Workers AI image models, which pydantic-ai can't
 build; only generate_image versions may use one."""
+
+SCHEMA_FILENAME = "agent-spec.schema.json"
+"""The committed copy of schema() in the agents directory, which version
+files point the editor at; regenerate it with `just agent-schema`."""
 
 # A version's spec is applied per run, and run-time spec values add to the
 # agent's own, so instructions or capabilities in a version file would quietly
@@ -148,3 +153,9 @@ def _settings_keys(model: Model) -> frozenset[str]:
         ModelSettings,
     )
     return settings_class.__optional_keys__ | settings_class.__required_keys__
+
+
+if __name__ == "__main__":
+    # `just agent-schema`: refresh the committed schema, e.g. after upgrading
+    # pydantic-ai changes it (a test fails until this is re-run).
+    (settings.agents_dir / SCHEMA_FILENAME).write_text(json.dumps(schema(), indent=2) + "\n")

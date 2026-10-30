@@ -1,19 +1,27 @@
 """Tests for loading and checking the per-step agent version files."""
 
+import json
 import re
 
 import pytest
 
 from comedy_factory.agent_versions import (
+    SCHEMA_FILENAME,
+    STEPS,
     AgentVersionError,
     available_versions,
     check_version_file,
     load_version,
+    schema,
 )
 from comedy_factory.settings import settings
 
 GEMINI = "google-cloud:gemini-3.5-flash"
 FLUX = "cloudflare:@cf/black-forest-labs/flux-1-schnell"
+
+# The repo's agents/ directory; tests repoint the setting only via the
+# `agents_dir` fixture, so this is read before any of them runs.
+COMMITTED = settings.agents_dir
 
 
 @pytest.fixture
@@ -166,3 +174,43 @@ def test_cloudflare_models_take_no_settings(agents_dir):
     )
     with pytest.raises(AgentVersionError, match="cloudflare: models take no model_settings"):
         check_version_file("generate_image", path)
+
+
+INITIAL_VERSIONS = [
+    ("find_topic", "gemini-flash", GEMINI, {}),
+    ("generate_subtext", "gemini-flash", GEMINI, {"thinking": "medium"}),
+    ("grade_subtext", "gemini-flash", GEMINI, {"thinking": "medium"}),
+    ("generate_joke", "gemini-flash", GEMINI, {"thinking": "high"}),
+    ("grade_joke", "gemini-flash", GEMINI, {"thinking": "medium"}),
+    ("rephrase_joke", "gemini-flash", GEMINI, {"thinking": "low"}),
+    ("write_image_prompt", "gemini-flash", GEMINI, {"thinking": "low"}),
+    ("generate_image", "gemini-flash-image", "google-cloud:gemini-3.1-flash-image", {}),
+    ("generate_image", "flux-schnell", FLUX, {}),
+    ("describe_image", "gemini-flash", GEMINI, {"thinking": False}),
+]
+
+
+@pytest.mark.parametrize(("step", "name", "model", "model_settings"), INITIAL_VERSIONS)
+def test_initial_versions_carry_over_todays_settings(step, name, model, model_settings):
+    version = load_version(step, name)
+    assert (version.model, version.model_settings) == (model, model_settings)
+
+
+@pytest.mark.parametrize(
+    "path",
+    sorted(COMMITTED.glob("*/*.yaml")),
+    ids=lambda path: f"{path.parent.name}/{path.stem}",
+)
+def test_committed_version_files_pass_the_checks(path):
+    check_version_file(path.parent.name, path)
+    first_line = path.read_text().splitlines()[0]
+    assert first_line == "# yaml-language-server: $schema=../agent-spec.schema.json"
+
+
+def test_agents_folder_has_one_folder_per_step():
+    assert {path.name for path in COMMITTED.iterdir() if path.is_dir()} == set(STEPS)
+
+
+def test_committed_schema_is_current():
+    committed = json.loads((COMMITTED / SCHEMA_FILENAME).read_text())
+    assert committed == schema(), "agents/agent-spec.schema.json is stale; run `just agent-schema`"

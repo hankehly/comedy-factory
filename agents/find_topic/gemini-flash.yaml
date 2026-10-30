@@ -1,0 +1,2 @@
+# yaml-language-server: $schema=../agent-spec.schema.json
+model: google-cloud:gemini-3.5-flash

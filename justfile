@@ -23,6 +23,10 @@ mypy *args:
 checkov *args:
     uvx checkov@3.3.11 {{args}}
 
+# Regenerate agents/agent-spec.schema.json from the installed pydantic-ai (after upgrading it)
+agent-schema:
+    uv run python -m comedy_factory.agent_versions
+
 # Draws on the pristine image-original.jpg and writes a datetime-stamped
 # image-captioned-<YYYYmmdd-HHMMSS>.jpg (later stamps are newer; existing
 # versions are kept untouched), so it can be re-run on the same bundle any

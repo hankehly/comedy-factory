@@ -6,6 +6,9 @@ import pytest
 # even though tests never make real requests. Must be set before any
 # comedy_factory import.
 os.environ.setdefault("GOOGLE_API_KEY", "test-api-key")
+# Agent version checks build each version's model with infer_model, which
+# demands the provider's API key; Claude versions need this one.
+os.environ.setdefault("ANTHROPIC_API_KEY", "test-api-key")
 
 from pydantic_ai import models  # noqa: E402
 

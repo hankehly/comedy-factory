@@ -54,6 +54,7 @@ class Settings(BaseSettings):
     write_image_prompt: StepConfig = StepConfig(model_settings={"thinking": "low"})
     describe_image: StepConfig = StepConfig(model_settings={"thinking": False})
     prompts_dir: Path = Path(__file__).parent.parent / "prompts"
+    agents_dir: Path = Path(__file__).parent.parent / "agents"
     output_dir: Path = Path(__file__).parent.parent / "output"
     max_grade_attempts: int = 3
     max_recent_topics: int = 20

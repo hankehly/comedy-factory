@@ -85,3 +85,14 @@ def test_loading_settings_checks_the_environment(monkeypatch):
     monkeypatch.setenv("COMEDY_FACTORY_IMAGE_PROVIDER", "cloudflare")
     with pytest.raises(ValueError, match="COMEDY_FACTORY_GENERATE_IMAGE_AGENT"):
         Settings()
+
+
+def test_env_errors_never_echo_secret_values(monkeypatch):
+    token = "cf-secret-0123456789abcdefghijklmnopqrstuvwxyz"
+    monkeypatch.setenv("CLOUDFLARE_API_TOKEN", token)
+    monkeypatch.setenv("COMEDY_FACTORY_GENERATE_IMAGE_AGNT", "flux-schnell")
+    with pytest.raises(ValueError, match="COMEDY_FACTORY_GENERATE_IMAGE_AGNT") as excinfo:
+        Settings()
+    message = str(excinfo.value)
+    assert token[:12] not in message
+    assert token[-12:] not in message

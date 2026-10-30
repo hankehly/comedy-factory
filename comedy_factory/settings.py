@@ -48,9 +48,12 @@ class Settings(BaseSettings):
     cloudflare_account_id: str = Field("", validation_alias="CLOUDFLARE_ACCOUNT_ID")
     cloudflare_api_token: str = Field("", validation_alias="CLOUDFLARE_API_TOKEN")
 
-    def model_post_init(self, context: Any, /) -> None:
-        super().model_post_init(context)
+    def __init__(self, **values: Any) -> None:
+        # Checked before validation, not in a validator or model_post_init:
+        # pydantic would wrap the error with a repr of the settings input,
+        # which ends with the Cloudflare API token.
         check_env(os.environ)
+        super().__init__(**values)
 
 
 def check_env(environ: Mapping[str, str]) -> None:

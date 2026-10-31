@@ -20,7 +20,7 @@ from datetime import datetime
 
 import pytest
 from PIL import Image, ImageFont
-from pydantic_ai import AgentSpec, NativeOutput, PromptedOutput
+from pydantic_ai import AgentSpec
 from pydantic_ai.messages import BinaryImage, FilePart, ModelResponse, TextPart
 from pydantic_ai.models import infer_model
 from pydantic_ai.models.function import AgentInfo, FunctionModel
@@ -46,7 +46,6 @@ from comedy_factory.joke_generator import (
     _google_image_agent,
     _grade_joke_agent,
     _grade_subtext_agent,
-    _output_spec,
     _recent_topics,
     _rephrase_joke_agent,
     _write_image_prompt_agent,
@@ -62,14 +61,20 @@ from comedy_factory.joke_generator import (
     save_asset,
     write_image_prompt,
 )
+from comedy_factory.models import StructuredOutputModel
 from comedy_factory.settings import settings
 from comedy_factory.utils import compose_alt_text, image_media_type
 
-# Grading uses output_mode="native" and image generation uses image output;
+# Structured steps answer in native (JSON-schema) output mode, which an
+# overriding stub model has to pick for itself (the step's own model, which
+# would pick it, is replaced); image generation uses image output.
 # TestModel/FunctionModel default profiles reject both. They also don't
 # support thinking, so pydantic-ai would strip the steps' `thinking` setting.
 _PROFILE = ModelProfile(
-    supports_json_schema_output=True, supports_image_output=True, supports_thinking=True
+    supports_json_schema_output=True,
+    default_structured_output_mode="native",
+    supports_image_output=True,
+    supports_thinking=True,
 )
 
 
@@ -219,35 +224,136 @@ def test_recent_topics_skips_unreadable_bundles_and_caps_the_count(monkeypatch, 
 
 def test_generate_subtext():
     canned = Subtext(text="A fake subtext.").model_dump_json()
-    with _generate_subtext_agent.override(model=canned_model(canned)):
-        subtext, history, cost = generate_subtext(
-            "A fake topic.", version=_version("generate_subtext")
+    with (
+        _generate_subtext_agent.override(model=canned_model(canned)),
+        _grade_subtext_agent.override(model=canned_model(Grade(passed=True).model_dump_json())),
+    ):
+        subtext, cost, grade_cost = generate_subtext(
+            "A fake topic.",
+            version=_version("generate_subtext"),
+            grader_version=_version("grade_subtext"),
         )
     assert subtext.text == "A fake subtext."
-    assert len(history) == 2  # templated prompt + model response
     assert isinstance(cost, StepCost)
+    assert isinstance(grade_cost, StepCost)
 
 
-def test_generate_subtext_retry_extends_history():
-    canned = Subtext(text="A better subtext.").model_dump_json()
-    version = _version("generate_subtext")
-    with _generate_subtext_agent.override(model=canned_model(canned)):
-        _, history, _ = generate_subtext("A fake topic.", version=version)
-        subtext, history, _ = generate_subtext(
-            "A fake topic.", history=history, feedback="* Too wordy.", version=version
+def _attempts_model(label: str, requests: list[list]) -> FunctionModel:
+    """A generator-step model that records each request's messages and answers
+    with a numbered attempt, so a test can see how many times it was asked and
+    what each rewrite request contained."""
+
+    def model(messages: list, info: AgentInfo) -> ModelResponse:
+        requests.append(messages)
+        text = (
+            Joke(text=f"{label} {len(requests)}.", rationale="Irony.")
+            if label == "Joke"
+            else Subtext(text=f"{label} {len(requests)}.")
+        ).model_dump_json()
+        return ModelResponse(parts=[TextPart(content=text)])
+
+    return FunctionModel(model, profile=_PROFILE)
+
+
+def _grades_model(*grades: Grade) -> FunctionModel:
+    """A grader-step model that hands out the given grades in order."""
+    remaining = iter(grades)
+
+    def model(messages: list, info: AgentInfo) -> ModelResponse:
+        return ModelResponse(parts=[TextPart(content=next(remaining).model_dump_json())])
+
+    return FunctionModel(model, profile=_PROFILE)
+
+
+def test_generate_subtext_retries_with_grader_feedback(log_output):
+    requests: list[list] = []
+    with (
+        _generate_subtext_agent.override(model=_attempts_model("Subtext", requests)),
+        _grade_subtext_agent.override(
+            model=_grades_model(
+                Grade(passed=False, feedback="* Too wordy."), Grade(passed=True)
+            )
+        ),
+    ):
+        subtext, cost, grade_cost = generate_subtext(
+            "A fake topic.",
+            version=_version("generate_subtext"),
+            grader_version=_version("grade_subtext"),
         )
-    assert subtext.text == "A better subtext."
-    assert len(history) == 4  # prompt, first attempt, feedback, rewrite
-    assert "Too wordy" in history[2].parts[0].content
+
+    assert subtext.text == "Subtext 2."
+    assert len(requests) == 2
+    # The rewrite request continues the same conversation: the templated
+    # prompt, the first attempt, and the grader's feedback as the retry.
+    prompt, first_attempt, retry = requests[1]
+    assert "A fake topic." in prompt.parts[0].content
+    assert "Subtext 1." in first_attempt.parts[0].content
+    assert "* Too wordy." in retry.parts[0].model_response()
+    assert "Subtext failed grading (attempt 1):\n* Too wordy." in "".join(log_output)
+    # Both attempts bill the generator; both gradings bill the grader.
+    assert cost.output_tokens > 0
+    assert grade_cost.output_tokens > 0
+
+
+def test_generate_subtext_gives_up_after_max_grade_attempts(monkeypatch, log_output):
+    monkeypatch.setattr(settings, "max_grade_attempts", 2)
+    requests: list[list] = []
+    with (
+        _generate_subtext_agent.override(model=_attempts_model("Subtext", requests)),
+        _grade_subtext_agent.override(
+            model=_grades_model(*[Grade(passed=False, feedback="* Still wrong.")] * 2)
+        ),
+        pytest.raises(RuntimeError, match="Subtext failed grading after 2 attempts"),
+    ):
+        generate_subtext(
+            "A fake topic.",
+            version=_version("generate_subtext"),
+            grader_version=_version("grade_subtext"),
+        )
+    assert len(requests) == 2
+    out = "".join(log_output)
+    assert "Subtext failed grading (attempt 1):\n* Still wrong." in out
+    assert "Subtext failed grading (attempt 2):\n* Still wrong." in out
 
 
 def test_generate_joke():
     canned = Joke(text="A fake joke.", rationale="Irony.").model_dump_json()
-    with _generate_joke_agent.override(model=canned_model(canned)):
-        joke, history, _ = generate_joke("A fake subtext.", version=_version("generate_joke"))
+    with (
+        _generate_joke_agent.override(model=canned_model(canned)),
+        _grade_joke_agent.override(model=canned_model(Grade(passed=True).model_dump_json())),
+    ):
+        joke, cost, grade_cost = generate_joke(
+            "A fake subtext.",
+            version=_version("generate_joke"),
+            grader_version=_version("grade_joke"),
+        )
     assert joke.text == "A fake joke."
     assert joke.rationale == "Irony."
-    assert len(history) == 2
+    assert isinstance(cost, StepCost)
+    assert isinstance(grade_cost, StepCost)
+
+
+def test_generate_joke_retries_with_grader_feedback(log_output):
+    requests: list[list] = []
+    with (
+        _generate_joke_agent.override(model=_attempts_model("Joke", requests)),
+        _grade_joke_agent.override(
+            model=_grades_model(
+                Grade(passed=False, feedback="* The funny part is not last."),
+                Grade(passed=True),
+            )
+        ),
+    ):
+        joke, _, _ = generate_joke(
+            "A fake subtext.",
+            version=_version("generate_joke"),
+            grader_version=_version("grade_joke"),
+        )
+
+    assert joke.text == "Joke 2."
+    assert len(requests) == 2
+    assert "* The funny part is not last." in requests[1][2].parts[0].model_response()
+    assert "Joke failed grading (attempt 1):\n* The funny part is not last." in "".join(log_output)
 
 
 def test_write_image_prompt():
@@ -532,41 +638,49 @@ def test_steps_send_their_configured_model_settings():
     assert info.model_settings == {"temperature": 0.0}
 
 
-def test_structured_steps_fall_back_to_prompted_output():
+@pytest.mark.parametrize(
+    ("supports_json_schema_output", "output_mode"), [(True, "native"), (False, "prompted")]
+)
+def test_structured_steps_request_the_output_mode_their_model_supports(
+    supports_json_schema_output, output_mode
+):
     seen = []
 
     def model(messages: list, info: AgentInfo) -> ModelResponse:
         seen.append(info)
         return ModelResponse(parts=[TextPart(content=Grade(passed=True).model_dump_json())])
 
-    # Claude Haiku has no native (JSON-schema) output, so the step falls back
-    # to prompted output; the stub answers in Haiku's place.
-    version = AgentVersion(
-        "grade_joke", "claude-haiku", AgentSpec(model="anthropic:claude-haiku-5-5")
+    # A model with native (JSON-schema) output is asked for it; one without,
+    # such as Claude Haiku, is asked for prompted output instead. Tool-call
+    # output is never used: Anthropic rejects forced tool use while thinking is
+    # enabled.
+    stub = FunctionModel(
+        model,
+        profile=ModelProfile(
+            supports_json_schema_output=supports_json_schema_output, supports_thinking=True
+        ),
     )
-    with _grade_joke_agent.override(model=FunctionModel(model, profile=_PROFILE)):
-        grade, _ = grade_joke("A fake subtext.", "A fake joke.", version=version)
+    with _grade_joke_agent.override(model=StructuredOutputModel(stub)):
+        grade, _ = grade_joke("A fake subtext.", "A fake joke.", version=_version("grade_joke"))
 
     assert grade.passed
     [info] = seen
-    assert info.model_request_parameters.output_mode == "prompted"
+    assert info.model_request_parameters.output_mode == output_mode
 
 
 @pytest.mark.parametrize(
-    ("model_name", "spec_type"),
+    ("model_name", "output_mode"),
     [
-        ("anthropic:claude-sonnet-5-5", NativeOutput),
-        ("anthropic:claude-opus-5-5", NativeOutput),
-        ("anthropic:claude-haiku-5-5", PromptedOutput),
+        ("anthropic:claude-sonnet-5-5", "native"),
+        ("anthropic:claude-opus-5-5", "native"),
+        ("anthropic:claude-haiku-5-5", "prompted"),
     ],
 )
-def test_structured_output_mode_follows_claude_model_profiles(
-    monkeypatch, model_name, spec_type
-):
+def test_structured_output_mode_follows_claude_model_profiles(monkeypatch, model_name, output_mode):
     # Building the model needs a key; no request is made.
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-api-key")
-    spec = _output_spec(Subtext, infer_model(model_name))
-    assert isinstance(spec, spec_type)
+    model = StructuredOutputModel(infer_model(model_name))
+    assert model.profile["default_structured_output_mode"] == output_mode
 
 
 def test_step_cost_addition_sums_tokens_and_known_costs():

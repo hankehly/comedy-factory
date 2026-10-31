@@ -28,7 +28,7 @@ from pydantic_ai.models.test import TestModel
 from pydantic_ai.profiles import ModelProfile
 
 from comedy_factory import joke_generator, recaption
-from comedy_factory.agent_versions import STEPS, AgentVersion, AgentVersionError, load_version
+from comedy_factory.agents import STEPS, AgentVersion, AgentVersionError, load_version
 from comedy_factory.captioning import _wrap_caption, render_caption
 from comedy_factory.joke_generator import (
     Grade,

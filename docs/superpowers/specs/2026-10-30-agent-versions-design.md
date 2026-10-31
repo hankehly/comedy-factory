@@ -330,7 +330,7 @@ Calls made while writing this spec, which the owner should check:
 
 ## Left to the builder
 
-- Module layout. For example, a small `comedy_factory/agent_versions.py`
+- Module layout. For example, a small `comedy_factory/agents.py`
   loader, in the spirit of `prompts.py`.
 - Exact error wording, docstrings and comments.
 - How tests stub models. pydantic-ai's `agent.override(model=...)` takes

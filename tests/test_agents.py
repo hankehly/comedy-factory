@@ -4,7 +4,7 @@ import re
 
 import pytest
 
-from comedy_factory.agent_versions import (
+from comedy_factory.agents import (
     STEPS,
     AgentVersionError,
     available_versions,

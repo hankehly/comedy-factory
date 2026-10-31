@@ -3,7 +3,7 @@ that rejects unknown COMEDY_FACTORY_* environment variables."""
 
 import pytest
 
-from comedy_factory.agent_versions import STEPS, available_versions
+from comedy_factory.agents import STEPS, available_versions
 from comedy_factory.settings import Settings, check_env, settings
 
 

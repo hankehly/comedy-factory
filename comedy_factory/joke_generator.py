@@ -73,7 +73,7 @@ from pydantic_ai.messages import (
 from pydantic_ai.models import Model, infer_model
 from pydantic_ai.output import OutputSpec
 
-from comedy_factory.agent_versions import CLOUDFLARE_PREFIX, AgentVersion, selected_versions
+from comedy_factory.agents import CLOUDFLARE_PREFIX, AgentVersion, selected_versions
 from comedy_factory.captioning import render_caption
 from comedy_factory.prompts import load_prompt
 from comedy_factory.settings import settings
@@ -226,7 +226,7 @@ class ImageDescription(BaseModel):
 
 
 # One agent per LLM step. None is bound to a model: each run is handed its
-# step's agent version (see _run_step and agent_versions.py), which supplies
+# step's agent version (see _run_step and agents.py), which supplies
 # the model and model settings. Finding a topic is the one step that loops
 # (search tool); the rest answer in a single structured response.
 _find_topic_agent = Agent(name="find_topic", capabilities=[WebSearch()])

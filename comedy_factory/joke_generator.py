@@ -73,15 +73,12 @@ from pydantic_ai import (
     UnexpectedModelBehavior,
 )
 from pydantic_ai.capabilities import WebSearch
-from pydantic_ai.messages import BinaryImage, ModelMessage, ModelResponse, UserContent
-from pydantic_ai.models import Model, ModelRequestParameters, infer_model
-from pydantic_ai.models.wrapper import WrapperModel
-from pydantic_ai.output import StructuredOutputMode
-from pydantic_ai.profiles import ModelProfile, merge_profile
-from pydantic_ai.settings import ModelSettings
+from pydantic_ai.messages import BinaryImage, ModelResponse, UserContent
+from pydantic_ai.models import infer_model
 
 from comedy_factory.agents import CLOUDFLARE_PREFIX, AgentVersion, selected_versions
 from comedy_factory.captioning import render_caption
+from comedy_factory.models import StructuredOutputModel
 from comedy_factory.prompts import load_prompt
 from comedy_factory.settings import settings
 from comedy_factory.utils import compose_alt_text, image_media_type
@@ -291,77 +288,8 @@ def _run_step(
 ) -> AgentRunResult[OutputT]:
     """Run a step's agent on one of its versions: the version's model, with
     the version applied as a run-time agent spec for its model settings."""
-    return agent.run_sync(prompt, model=_step_model(version), spec=version.spec)
-
-
-def _run_graded_step(
-    agent: Agent[GradedRun, OutputT],
-    version: AgentVersion,
-    prompt: str,
-    deps: GradedRun,
-    *,
-    name: str,
-) -> AgentRunResult[OutputT]:
-    """Run a generation step whose output validator grades each attempt. The
-    run gets `max_grade_attempts` attempts in all: the first plus that many
-    output retries less one. pydantic-ai spends the same retry budget on a
-    malformed structured response, so one of those costs a grading attempt.
-    Running out raises RuntimeError naming the step's output (`name`), as the
-    pipeline always has."""
-    try:
-        return agent.run_sync(
-            prompt,
-            model=_step_model(version),
-            spec=version.spec,
-            deps=deps,
-            retries={"output": settings.max_grade_attempts - 1},
-        )
-    except UnexpectedModelBehavior as e:
-        raise RuntimeError(
-            f"{name} failed grading after {settings.max_grade_attempts} attempts"
-        ) from e
-
-
-def _step_model(version: AgentVersion) -> Model:
-    """The model a step runs on: the version's model, set to request structured
-    output the way it supports."""
-    return _StructuredOutputModel(infer_model(version.model))
-
-
-class _StructuredOutputModel(WrapperModel):
-    """A model that asks for a step's structured output natively
-    (JSON-schema constrained) where it supports that, as with Gemini and Claude
-    Sonnet/Opus, otherwise with the schema in the prompt (e.g. Claude Haiku).
-    Tool-call output, pydantic-ai's default, is avoided: Anthropic rejects
-    forced tool use while thinking is enabled. Pinned on the model rather than
-    chosen per run because the agents' output types have to stay fixed: an
-    agent with output validators takes no run-time output type.
-    Non-structured outputs pass through as is."""
-
-    def __init__(self, wrapped: Model) -> None:
-        super().__init__(wrapped)
-        native = wrapped.profile.get("supports_json_schema_output", False)
-        self._output_mode: StructuredOutputMode = "native" if native else "prompted"
-
-    @property
-    def profile(self) -> ModelProfile:  # type: ignore[override]
-        return merge_profile(
-            self.wrapped.profile, ModelProfile(default_structured_output_mode=self._output_mode)
-        )
-
-    async def request(
-        self,
-        messages: list[ModelMessage],
-        model_settings: ModelSettings | None,
-        model_request_parameters: ModelRequestParameters,
-    ) -> ModelResponse:
-        # The wrapped model resolves an undecided ("auto") output mode from its
-        # own profile, so decide it here first.
-        return await self.wrapped.request(
-            messages,
-            model_settings,
-            model_request_parameters.with_default_output_mode(self._output_mode),
-        )
+    model = StructuredOutputModel(infer_model(version.model))
+    return agent.run_sync(prompt, model=model, spec=version.spec)
 
 
 def _recent_topics() -> list[str]:
@@ -421,13 +349,28 @@ def generate_subtext(
     generation step's usage and cost and the grader's.
 
     A failed grading goes back to the model as a retry in the same
-    conversation, so it sees its previous attempts and the feedback on them;
-    after `max_grade_attempts` attempts the step gives up with RuntimeError.
+    conversation, so it sees its previous attempts and the feedback on them.
+    The run gets `max_grade_attempts` attempts in all: the first plus that
+    many output retries less one. pydantic-ai spends the same retry budget on
+    a malformed structured response, so one of those costs a grading attempt.
+    Running out raises RuntimeError.
     """
     prompt = load_prompt("generate-subtext.md", TOPIC=topic)
     deps = GradedRun(context=topic, grader_version=grader_version)
+    model = StructuredOutputModel(infer_model(version.model))
 
-    result = _run_graded_step(_generate_subtext_agent, version, prompt, deps, name="Subtext")
+    try:
+        result = _generate_subtext_agent.run_sync(
+            prompt,
+            model=model,
+            spec=version.spec,
+            deps=deps,
+            retries={"output": settings.max_grade_attempts - 1},
+        )
+    except UnexpectedModelBehavior as e:
+        raise RuntimeError(
+            f"Subtext failed grading after {settings.max_grade_attempts} attempts"
+        ) from e
     return result.output, _run_cost(result), deps.grader_cost
 
 
@@ -440,13 +383,28 @@ def generate_joke(
     the grader's.
 
     A failed grading goes back to the model as a retry in the same
-    conversation, so it sees its previous attempts and the feedback on them;
-    after `max_grade_attempts` attempts the step gives up with RuntimeError.
+    conversation, so it sees its previous attempts and the feedback on them.
+    The run gets `max_grade_attempts` attempts in all: the first plus that
+    many output retries less one. pydantic-ai spends the same retry budget on
+    a malformed structured response, so one of those costs a grading attempt.
+    Running out raises RuntimeError.
     """
     prompt = load_prompt("generate-joke.md", SUBTEXT=subtext)
     deps = GradedRun(context=subtext, grader_version=grader_version)
+    model = StructuredOutputModel(infer_model(version.model))
 
-    result = _run_graded_step(_generate_joke_agent, version, prompt, deps, name="Joke")
+    try:
+        result = _generate_joke_agent.run_sync(
+            prompt,
+            model=model,
+            spec=version.spec,
+            deps=deps,
+            retries={"output": settings.max_grade_attempts - 1},
+        )
+    except UnexpectedModelBehavior as e:
+        raise RuntimeError(
+            f"Joke failed grading after {settings.max_grade_attempts} attempts"
+        ) from e
     return result.output, _run_cost(result), deps.grader_cost
 
 

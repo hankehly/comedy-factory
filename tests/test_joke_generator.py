@@ -22,6 +22,7 @@ import pytest
 from PIL import Image, ImageFont
 from pydantic_ai import AgentSpec
 from pydantic_ai.messages import BinaryImage, FilePart, ModelResponse, TextPart
+from pydantic_ai.models import infer_model
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.models.test import TestModel
 from pydantic_ai.profiles import ModelProfile
@@ -47,8 +48,6 @@ from comedy_factory.joke_generator import (
     _grade_subtext_agent,
     _recent_topics,
     _rephrase_joke_agent,
-    _step_model,
-    _StructuredOutputModel,
     _write_image_prompt_agent,
     describe_image,
     find_topic,
@@ -62,6 +61,7 @@ from comedy_factory.joke_generator import (
     save_asset,
     write_image_prompt,
 )
+from comedy_factory.models import StructuredOutputModel
 from comedy_factory.settings import settings
 from comedy_factory.utils import compose_alt_text, image_media_type
 
@@ -660,7 +660,7 @@ def test_structured_steps_request_the_output_mode_their_model_supports(
             supports_json_schema_output=supports_json_schema_output, supports_thinking=True
         ),
     )
-    with _grade_joke_agent.override(model=_StructuredOutputModel(stub)):
+    with _grade_joke_agent.override(model=StructuredOutputModel(stub)):
         grade, _ = grade_joke("A fake subtext.", "A fake joke.", version=_version("grade_joke"))
 
     assert grade.passed
@@ -679,8 +679,8 @@ def test_structured_steps_request_the_output_mode_their_model_supports(
 def test_structured_output_mode_follows_claude_model_profiles(monkeypatch, model_name, output_mode):
     # Building the model needs a key; no request is made.
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-api-key")
-    version = AgentVersion("grade_joke", "claude", AgentSpec(model=model_name))
-    assert _step_model(version).profile["default_structured_output_mode"] == output_mode
+    model = StructuredOutputModel(infer_model(model_name))
+    assert model.profile["default_structured_output_mode"] == output_mode
 
 
 def test_step_cost_addition_sums_tokens_and_known_costs():

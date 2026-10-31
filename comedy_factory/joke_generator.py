@@ -7,14 +7,16 @@ one-sentence topic with its source URL.
 Step 2 — Generate subtext: LLM step that turns a topic into a subtext — the
 writer's opinion, the idea the eventual joke communicates.
 
-Step 3 — Grade subtext: evaluation gate. If the subtext breaks a rule, the
-workflow re-runs step 2 with the grader's feedback.
+Step 3 — Grade subtext: evaluation gate, run as step 2's output validator. If
+the subtext breaks a rule, the grader's feedback goes back to the model as a
+retry in the same conversation.
 
 Step 4 — Generate joke: LLM step that filters the subtext through a "funny
 filter" (irony, character, shock, hyperbole) into a short joke.
 
-Step 5 — Grade joke: evaluation gate. If the joke breaks a rule, the workflow
-re-runs step 4 with the grader's feedback.
+Step 5 — Grade joke: evaluation gate, run as step 4's output validator. If the
+joke breaks a rule, the grader's feedback goes back to the model as a retry in
+the same conversation.
 
 Step 6 — Rephrase joke: LLM step that writes N alternative phrasings of the
 approved joke for later human review and possible recaptioning. No grading
@@ -55,23 +57,28 @@ import json
 import re
 from collections import defaultdict
 from collections.abc import Sequence
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import TypeVar, cast
+from typing import TypeVar
 
 import httpx
 from loguru import logger
 from pydantic import BaseModel, Field
-from pydantic_ai import Agent, AgentRunResult, NativeOutput, PromptedOutput
-from pydantic_ai.capabilities import WebSearch
-from pydantic_ai.messages import (
-    BinaryImage,
-    ModelMessage,
-    ModelResponse,
-    UserContent,
+from pydantic_ai import (
+    Agent,
+    AgentRunResult,
+    ModelRetry,
+    RunContext,
+    UnexpectedModelBehavior,
 )
-from pydantic_ai.models import Model, infer_model
-from pydantic_ai.output import OutputSpec
+from pydantic_ai.capabilities import WebSearch
+from pydantic_ai.messages import BinaryImage, ModelMessage, ModelResponse, UserContent
+from pydantic_ai.models import Model, ModelRequestParameters, infer_model
+from pydantic_ai.models.wrapper import WrapperModel
+from pydantic_ai.output import StructuredOutputMode
+from pydantic_ai.profiles import ModelProfile, merge_profile
+from pydantic_ai.settings import ModelSettings
 
 from comedy_factory.agents import CLOUDFLARE_PREFIX, AgentVersion, selected_versions
 from comedy_factory.captioning import render_caption
@@ -188,8 +195,8 @@ def _response_cost(response: ModelResponse) -> StepCost:
 
 def _run_cost(result: AgentRunResult[object]) -> StepCost:
     """Token usage and estimated cost of an agent run. A run may take several
-    model responses (a tool loop, an output-validation retry); sum them all,
-    leaving out the earlier turns passed in as message history."""
+    model responses (a tool loop, the rewrites after failed gradings); sum
+    them all."""
     return sum(
         (
             _response_cost(message)
@@ -225,14 +232,29 @@ class ImageDescription(BaseModel):
     )
 
 
+@dataclass
+class GradedRun:
+    """Run dependencies of a generation step with an evaluation gate: what the
+    step's output validator needs to grade each attempt, and where it leaves
+    the grader's costs so they are reported under the grader's own step."""
+
+    context: str
+    """What the output is graded against: the topic for a subtext, the
+    subtext for a joke."""
+    grader_version: AgentVersion
+    grader_cost: StepCost = field(default_factory=StepCost)
+
+
 # One agent per LLM step. None is bound to a model: each run is handed its
 # step's agent version (see _run_step and agents.py), which supplies
 # the model and model settings. Finding a topic is the one step that loops
-# (search tool); the rest answer in a single structured response.
+# (search tool); the rest answer in a single structured response. The two
+# generation steps with an evaluation gate carry a GradedRun: their output
+# validators (below) run the grader and send a fail back as a retry.
 _find_topic_agent = Agent(name="find_topic", capabilities=[WebSearch()])
-_generate_subtext_agent = Agent(name="generate_subtext", output_type=Subtext)
+_generate_subtext_agent = Agent(name="generate_subtext", output_type=Subtext, deps_type=GradedRun)
 _grade_subtext_agent = Agent(name="grade_subtext", output_type=Grade)
-_generate_joke_agent = Agent(name="generate_joke", output_type=Joke)
+_generate_joke_agent = Agent(name="generate_joke", output_type=Joke, deps_type=GradedRun)
 _grade_joke_agent = Agent(name="grade_joke", output_type=Grade)
 _rephrase_joke_agent = Agent(name="rephrase_joke", output_type=Rephrasings)
 _write_image_prompt_agent = Agent(name="write_image_prompt", output_type=ImagePrompt)
@@ -240,38 +262,106 @@ _google_image_agent = Agent(name="generate_image", output_type=BinaryImage)
 _describe_image_agent = Agent(name="describe_image", output_type=ImageDescription)
 
 
+@_generate_subtext_agent.output_validator
+def _grade_subtext_output(ctx: RunContext[GradedRun], subtext: Subtext) -> Subtext:
+    """Step 3: grade the subtext; a fail goes back to the model as a retry."""
+    grade, cost = grade_subtext(ctx.deps.context, subtext.text, version=ctx.deps.grader_version)
+    ctx.deps.grader_cost += cost
+    if not grade.passed:
+        logger.warning(f"Subtext failed grading (attempt {ctx.retry + 1}):\n{grade.feedback}")
+        raise ModelRetry(grade.feedback)
+    return subtext
+
+
+@_generate_joke_agent.output_validator
+def _grade_joke_output(ctx: RunContext[GradedRun], joke: Joke) -> Joke:
+    """Step 5: grade the joke; a fail goes back to the model as a retry."""
+    grade, cost = grade_joke(ctx.deps.context, joke.text, version=ctx.deps.grader_version)
+    ctx.deps.grader_cost += cost
+    if not grade.passed:
+        logger.warning(f"Joke failed grading (attempt {ctx.retry + 1}):\n{grade.feedback}")
+        raise ModelRetry(grade.feedback)
+    return joke
+
+
 def _run_step(
     agent: Agent[None, OutputT],
     version: AgentVersion,
     prompt: str | Sequence[UserContent],
-    message_history: list[ModelMessage] | None = None,
 ) -> AgentRunResult[OutputT]:
     """Run a step's agent on one of its versions: the version's model, with
     the version applied as a run-time agent spec for its model settings."""
-    model = infer_model(version.model)
-    return agent.run_sync(
-        prompt,
-        model=model,
-        spec=version.spec,
-        message_history=message_history,
-        output_type=_output_spec(agent.output_type, model),
-    )
+    return agent.run_sync(prompt, model=_step_model(version), spec=version.spec)
 
 
-def _output_spec(output_type: OutputSpec[OutputT], model: Model) -> OutputSpec[OutputT]:
-    """How the model should return a step's structured output: natively
-    (JSON-schema constrained) where it supports that, as with Gemini and
-    Claude Sonnet/Opus, otherwise with the schema in the prompt (e.g. Claude
-    Haiku). Tool-call output is avoided: Anthropic rejects forced tool use
-    while thinking is enabled. Non-structured outputs pass through as is."""
-    # Narrowing a separate name keeps `output_type`'s declared type intact for
-    # the passthrough return; mypy can't carry OutputT through issubclass().
-    candidate: object = output_type
-    if isinstance(candidate, type) and issubclass(candidate, BaseModel):
-        native = model.profile.get("supports_json_schema_output", False)
-        wrapper = NativeOutput if native else PromptedOutput
-        return cast(OutputSpec[OutputT], wrapper(candidate))
-    return output_type
+def _run_graded_step(
+    agent: Agent[GradedRun, OutputT],
+    version: AgentVersion,
+    prompt: str,
+    deps: GradedRun,
+    *,
+    name: str,
+) -> AgentRunResult[OutputT]:
+    """Run a generation step whose output validator grades each attempt. The
+    run gets `max_grade_attempts` attempts in all: the first plus that many
+    output retries less one. pydantic-ai spends the same retry budget on a
+    malformed structured response, so one of those costs a grading attempt.
+    Running out raises RuntimeError naming the step's output (`name`), as the
+    pipeline always has."""
+    try:
+        return agent.run_sync(
+            prompt,
+            model=_step_model(version),
+            spec=version.spec,
+            deps=deps,
+            retries={"output": settings.max_grade_attempts - 1},
+        )
+    except UnexpectedModelBehavior as e:
+        raise RuntimeError(
+            f"{name} failed grading after {settings.max_grade_attempts} attempts"
+        ) from e
+
+
+def _step_model(version: AgentVersion) -> Model:
+    """The model a step runs on: the version's model, set to request structured
+    output the way it supports."""
+    return _StructuredOutputModel(infer_model(version.model))
+
+
+class _StructuredOutputModel(WrapperModel):
+    """A model that asks for a step's structured output natively
+    (JSON-schema constrained) where it supports that, as with Gemini and Claude
+    Sonnet/Opus, otherwise with the schema in the prompt (e.g. Claude Haiku).
+    Tool-call output, pydantic-ai's default, is avoided: Anthropic rejects
+    forced tool use while thinking is enabled. Pinned on the model rather than
+    chosen per run because the agents' output types have to stay fixed: an
+    agent with output validators takes no run-time output type.
+    Non-structured outputs pass through as is."""
+
+    def __init__(self, wrapped: Model) -> None:
+        super().__init__(wrapped)
+        native = wrapped.profile.get("supports_json_schema_output", False)
+        self._output_mode: StructuredOutputMode = "native" if native else "prompted"
+
+    @property
+    def profile(self) -> ModelProfile:  # type: ignore[override]
+        return merge_profile(
+            self.wrapped.profile, ModelProfile(default_structured_output_mode=self._output_mode)
+        )
+
+    async def request(
+        self,
+        messages: list[ModelMessage],
+        model_settings: ModelSettings | None,
+        model_request_parameters: ModelRequestParameters,
+    ) -> ModelResponse:
+        # The wrapped model resolves an undecided ("auto") output mode from its
+        # own profile, so decide it here first.
+        return await self.wrapped.request(
+            messages,
+            model_settings,
+            model_request_parameters.with_default_output_mode(self._output_mode),
+        )
 
 
 def _recent_topics() -> list[str]:
@@ -324,50 +414,40 @@ def find_topic(*, version: AgentVersion) -> tuple[Topic, StepCost]:
 
 
 def generate_subtext(
-    topic: str,
-    history: list[ModelMessage] | None = None,
-    feedback: str | None = None,
-    *,
-    version: AgentVersion,
-) -> tuple[Subtext, list[ModelMessage], StepCost]:
-    """Return a subtext — the writer's opinion about a news topic — the
-    conversation history that produced it, and the call's usage and cost.
+    topic: str, *, version: AgentVersion, grader_version: AgentVersion
+) -> tuple[Subtext, StepCost, StepCost]:
+    """Return a subtext — the writer's opinion about a news topic — that
+    passed grading (step 3, run on `grader_version`), along with the
+    generation step's usage and cost and the grader's.
 
-    To request a rewrite after a failed grading, pass back the returned
-    `history` along with the grader's `feedback`; the model then sees its
-    previous attempts as prior turns of the conversation.
+    A failed grading goes back to the model as a retry in the same
+    conversation, so it sees its previous attempts and the feedback on them;
+    after `max_grade_attempts` attempts the step gives up with RuntimeError.
     """
-    if history is None:
-        prompt = load_prompt("generate-subtext.md", TOPIC=topic)
-    else:
-        prompt = load_prompt("rewrite-with-feedback.md", FEEDBACK=feedback)
+    prompt = load_prompt("generate-subtext.md", TOPIC=topic)
+    deps = GradedRun(context=topic, grader_version=grader_version)
 
-    result = _run_step(_generate_subtext_agent, version, prompt, history)
-    return result.output, result.all_messages(), _run_cost(result)
+    result = _run_graded_step(_generate_subtext_agent, version, prompt, deps, name="Subtext")
+    return result.output, _run_cost(result), deps.grader_cost
 
 
 def generate_joke(
-    subtext: str,
-    history: list[ModelMessage] | None = None,
-    feedback: str | None = None,
-    *,
-    version: AgentVersion,
-) -> tuple[Joke, list[ModelMessage], StepCost]:
+    subtext: str, *, version: AgentVersion, grader_version: AgentVersion
+) -> tuple[Joke, StepCost, StepCost]:
     """Return a joke communicating the subtext — along with the rationale
-    behind its construction — the conversation history that produced it, and
-    the call's usage and cost.
+    behind its construction — that passed grading (step 5, run on
+    `grader_version`), along with the generation step's usage and cost and
+    the grader's.
 
-    To request a rewrite after a failed grading, pass back the returned
-    `history` along with the grader's `feedback`; the model then sees its
-    previous attempts as prior turns of the conversation.
+    A failed grading goes back to the model as a retry in the same
+    conversation, so it sees its previous attempts and the feedback on them;
+    after `max_grade_attempts` attempts the step gives up with RuntimeError.
     """
-    if history is None:
-        prompt = load_prompt("generate-joke.md", SUBTEXT=subtext)
-    else:
-        prompt = load_prompt("rewrite-with-feedback.md", FEEDBACK=feedback)
+    prompt = load_prompt("generate-joke.md", SUBTEXT=subtext)
+    deps = GradedRun(context=subtext, grader_version=grader_version)
 
-    result = _run_step(_generate_joke_agent, version, prompt, history)
-    return result.output, result.all_messages(), _run_cost(result)
+    result = _run_graded_step(_generate_joke_agent, version, prompt, deps, name="Joke")
+    return result.output, _run_cost(result), deps.grader_cost
 
 
 def write_image_prompt(joke: Joke, *, version: AgentVersion) -> tuple[ImagePrompt, StepCost]:
@@ -548,44 +628,22 @@ def main():
     logger.info(f"Topic: {topic.text}")
     logger.info(f"Source: {topic.source_url}")
 
-    history = None
-    feedback = None
-    for attempt in range(1, settings.max_grade_attempts + 1):
-        subtext, history, cost = generate_subtext(
-            topic.text, history, feedback, version=versions["generate_subtext"]
-        )
-        costs["generate_subtext"] += cost
-        grade, cost = grade_subtext(
-            topic.text, subtext.text, version=versions["grade_subtext"]
-        )
-        costs["grade_subtext"] += cost
-        if grade.passed:
-            break
-        feedback = grade.feedback
-        logger.warning(f"Subtext failed grading (attempt {attempt}):\n{feedback}")
-    else:
-        raise RuntimeError(
-            f"Subtext failed grading after {settings.max_grade_attempts} attempts"
-        )
+    subtext, cost, grade_cost = generate_subtext(
+        topic.text,
+        version=versions["generate_subtext"],
+        grader_version=versions["grade_subtext"],
+    )
+    costs["generate_subtext"] += cost
+    costs["grade_subtext"] += grade_cost
     logger.info(f"Subtext: {subtext.text}")
 
-    history = None
-    feedback = None
-    for attempt in range(1, settings.max_grade_attempts + 1):
-        joke, history, cost = generate_joke(
-            subtext.text, history, feedback, version=versions["generate_joke"]
-        )
-        costs["generate_joke"] += cost
-        grade, cost = grade_joke(subtext.text, joke.text, version=versions["grade_joke"])
-        costs["grade_joke"] += cost
-        if grade.passed:
-            break
-        feedback = grade.feedback
-        logger.warning(f"Joke failed grading (attempt {attempt}):\n{feedback}")
-    else:
-        raise RuntimeError(
-            f"Joke failed grading after {settings.max_grade_attempts} attempts"
-        )
+    joke, cost, grade_cost = generate_joke(
+        subtext.text,
+        version=versions["generate_joke"],
+        grader_version=versions["grade_joke"],
+    )
+    costs["generate_joke"] += cost
+    costs["grade_joke"] += grade_cost
     logger.info(f"Joke: {joke.text}")
     logger.info(f"Rationale: {joke.rationale}")
 

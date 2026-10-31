@@ -88,7 +88,9 @@ def test_loading_settings_checks_the_environment(monkeypatch):
 
 
 def test_env_errors_never_echo_secret_values(monkeypatch):
-    token = "cf-secret-0123456789abcdefghijklmnopqrstuvwxyz"
+    # Low-entropy on purpose, so checkov's secret scanner doesn't flag the
+    # fixture itself.
+    token = "not-a-real-token-" + "x" * 30
     monkeypatch.setenv("CLOUDFLARE_API_TOKEN", token)
     monkeypatch.setenv("COMEDY_FACTORY_GENERATE_IMAGE_AGNT", "flux-schnell")
     with pytest.raises(ValueError, match="COMEDY_FACTORY_GENERATE_IMAGE_AGNT") as excinfo:

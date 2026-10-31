@@ -323,6 +323,7 @@ def test_generate_joke():
         _grade_joke_agent.override(model=canned_model(Grade(passed=True).model_dump_json())),
     ):
         joke, cost, grade_cost = generate_joke(
+            "A fake topic.",
             "A fake subtext.",
             version=_version("generate_joke"),
             grader_version=_version("grade_joke"),
@@ -331,6 +332,52 @@ def test_generate_joke():
     assert joke.rationale == "Irony."
     assert isinstance(cost, StepCost)
     assert isinstance(grade_cost, StepCost)
+
+
+def test_generate_joke_writes_from_the_topic_and_subtext():
+    requests: list[list] = []
+    with (
+        _generate_joke_agent.override(model=_attempts_model("Joke", requests)),
+        _grade_joke_agent.override(model=canned_model(Grade(passed=True).model_dump_json())),
+    ):
+        generate_joke(
+            "A fake topic.",
+            "A fake subtext.",
+            version=_version("generate_joke"),
+            grader_version=_version("grade_joke"),
+        )
+
+    # The writer gets the news story along with the subtext, each in its own
+    # section, so it can draw the joke's specific details from the story.
+    [[prompt]] = requests
+    assert "## Topic\n\nA fake topic." in prompt.parts[0].content
+    assert "## Subtext\n\nA fake subtext." in prompt.parts[0].content
+
+
+def test_generate_joke_grades_against_the_topic_and_subtext():
+    grader_prompts: list[str] = []
+
+    def grader(messages: list, info: AgentInfo) -> ModelResponse:
+        grader_prompts.append(messages[0].parts[0].content)
+        return ModelResponse(parts=[TextPart(content=Grade(passed=True).model_dump_json())])
+
+    canned = Joke(text="A fake joke.", rationale="Irony.").model_dump_json()
+    with (
+        _generate_joke_agent.override(model=canned_model(canned)),
+        _grade_joke_agent.override(model=FunctionModel(grader, profile=_PROFILE)),
+    ):
+        generate_joke(
+            "A fake topic.",
+            "A fake subtext.",
+            version=_version("generate_joke"),
+            grader_version=_version("grade_joke"),
+        )
+
+    # The grader sees the story too, so it can check the joke is about it.
+    [prompt] = grader_prompts
+    assert "## Topic\n\nA fake topic." in prompt
+    assert "## Subtext\n\nA fake subtext." in prompt
+    assert "## Joke\n\nA fake joke." in prompt
 
 
 def test_generate_joke_retries_with_grader_feedback(log_output):
@@ -345,6 +392,7 @@ def test_generate_joke_retries_with_grader_feedback(log_output):
         ),
     ):
         joke, _, _ = generate_joke(
+            "A fake topic.",
             "A fake subtext.",
             version=_version("generate_joke"),
             grader_version=_version("grade_joke"),
@@ -608,7 +656,9 @@ def test_grade_subtext_fail():
 def test_grade_joke_fail():
     canned = Grade(passed=False, feedback="* The funny part is not last.").model_dump_json()
     with _grade_joke_agent.override(model=canned_model(canned)):
-        grade, _ = grade_joke("A fake subtext.", "A fake joke.", version=_version("grade_joke"))
+        grade, _ = grade_joke(
+            "A fake topic.", "A fake subtext.", "A fake joke.", version=_version("grade_joke")
+        )
     assert not grade.passed
     assert grade.feedback == "* The funny part is not last."
 
@@ -629,7 +679,7 @@ def test_steps_send_their_configured_model_settings():
         ),
     )
     with _grade_joke_agent.override(model=FunctionModel(model, profile=_PROFILE)):
-        grade_joke("A fake subtext.", "A fake joke.", version=version)
+        grade_joke("A fake topic.", "A fake subtext.", "A fake joke.", version=version)
 
     [info] = seen
     # pydantic-ai resolves the unified `thinking` setting into the request
@@ -661,7 +711,9 @@ def test_structured_steps_request_the_output_mode_their_model_supports(
         ),
     )
     with _grade_joke_agent.override(model=StructuredOutputModel(stub)):
-        grade, _ = grade_joke("A fake subtext.", "A fake joke.", version=_version("grade_joke"))
+        grade, _ = grade_joke(
+            "A fake topic.", "A fake subtext.", "A fake joke.", version=_version("grade_joke")
+        )
 
     assert grade.passed
     [info] = seen
@@ -859,6 +911,27 @@ def test_main_smoke(monkeypatch, tmp_path, log_output):
     assert set(metadata["costs"]["total"]) == {"input_tokens", "output_tokens", "usd"}
     assert set(metadata["agents"]) == set(STEPS)
     assert metadata["agents"]["generate_image"]["version"] == "gemini-flash-image"
+
+
+def test_main_writes_the_joke_from_the_found_topic():
+    joke_prompts: list[str] = []
+    pipeline = _pipeline_model()
+
+    def model(messages: list, info: AgentInfo) -> ModelResponse:
+        output_object = info.model_request_parameters.output_object
+        if output_object is not None and output_object.json_schema["title"] == "Joke":
+            joke_prompts.append(messages[0].parts[0].content)
+        return pipeline(messages, info)
+
+    with (
+        _override_step_models(FunctionModel(model, profile=_PROFILE)),
+        _find_topic_agent.override(model=canned_model("A fake topic."), native_tools=[]),
+    ):
+        joke_generator.main()
+
+    [prompt] = joke_prompts
+    assert "## Topic\n\nA fake topic." in prompt
+    assert "## Subtext\n\nA fake subtext." in prompt
 
 
 def test_main_retries_failed_joke_grading(log_output):

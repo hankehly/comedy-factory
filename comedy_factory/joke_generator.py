@@ -11,8 +11,8 @@ Step 3 — Grade subtext: evaluation gate, run as step 2's output validator. If
 the subtext breaks a rule, the grader's feedback goes back to the model as a
 retry in the same conversation.
 
-Step 4 — Generate joke: LLM step that filters the subtext through a "funny
-filter" (irony, character, shock, hyperbole) into a short joke.
+Step 4 — Generate joke: LLM step that filters the subtext through one or more
+"funny filters" into a short joke, drawing its specific details from the topic.
 
 Step 5 — Grade joke: evaluation gate, run as step 4's output validator. If the
 joke breaks a rule, the grader's feedback goes back to the model as a retry in
@@ -235,11 +235,18 @@ class GradedRun:
     step's output validator needs to grade each attempt, and where it leaves
     the grader's costs so they are reported under the grader's own step."""
 
-    context: str
-    """What the output is graded against: the topic for a subtext, the
-    subtext for a joke."""
+    topic: str
+    """The news topic the output was written about; the grader sees it too."""
     grader_version: AgentVersion
     grader_cost: StepCost = field(default_factory=StepCost)
+
+
+@dataclass(kw_only=True)
+class GradedJokeRun(GradedRun):
+    """Run dependencies of the joke step: a joke is graded against the subtext
+    it was written to reveal as well as the topic."""
+
+    subtext: str
 
 
 # One agent per LLM step. None is bound to a model: each run is handed its
@@ -251,7 +258,7 @@ class GradedRun:
 _find_topic_agent = Agent(name="find_topic", capabilities=[WebSearch()])
 _generate_subtext_agent = Agent(name="generate_subtext", output_type=Subtext, deps_type=GradedRun)
 _grade_subtext_agent = Agent(name="grade_subtext", output_type=Grade)
-_generate_joke_agent = Agent(name="generate_joke", output_type=Joke, deps_type=GradedRun)
+_generate_joke_agent = Agent(name="generate_joke", output_type=Joke, deps_type=GradedJokeRun)
 _grade_joke_agent = Agent(name="grade_joke", output_type=Grade)
 _rephrase_joke_agent = Agent(name="rephrase_joke", output_type=Rephrasings)
 _write_image_prompt_agent = Agent(name="write_image_prompt", output_type=ImagePrompt)
@@ -262,7 +269,7 @@ _describe_image_agent = Agent(name="describe_image", output_type=ImageDescriptio
 @_generate_subtext_agent.output_validator
 def _grade_subtext_output(ctx: RunContext[GradedRun], subtext: Subtext) -> Subtext:
     """Step 3: grade the subtext; a fail goes back to the model as a retry."""
-    grade, cost = grade_subtext(ctx.deps.context, subtext.text, version=ctx.deps.grader_version)
+    grade, cost = grade_subtext(ctx.deps.topic, subtext.text, version=ctx.deps.grader_version)
     ctx.deps.grader_cost += cost
     if not grade.passed:
         logger.warning(f"Subtext failed grading (attempt {ctx.retry + 1}):\n{grade.feedback}")
@@ -271,9 +278,11 @@ def _grade_subtext_output(ctx: RunContext[GradedRun], subtext: Subtext) -> Subte
 
 
 @_generate_joke_agent.output_validator
-def _grade_joke_output(ctx: RunContext[GradedRun], joke: Joke) -> Joke:
+def _grade_joke_output(ctx: RunContext[GradedJokeRun], joke: Joke) -> Joke:
     """Step 5: grade the joke; a fail goes back to the model as a retry."""
-    grade, cost = grade_joke(ctx.deps.context, joke.text, version=ctx.deps.grader_version)
+    grade, cost = grade_joke(
+        ctx.deps.topic, ctx.deps.subtext, joke.text, version=ctx.deps.grader_version
+    )
     ctx.deps.grader_cost += cost
     if not grade.passed:
         logger.warning(f"Joke failed grading (attempt {ctx.retry + 1}):\n{grade.feedback}")
@@ -356,7 +365,7 @@ def generate_subtext(
     Running out raises RuntimeError.
     """
     prompt = load_prompt("generate-subtext.md", TOPIC=topic)
-    deps = GradedRun(context=topic, grader_version=grader_version)
+    deps = GradedRun(topic=topic, grader_version=grader_version)
     model = StructuredOutputModel(infer_model(version.model))
 
     try:
@@ -375,12 +384,12 @@ def generate_subtext(
 
 
 def generate_joke(
-    subtext: str, *, version: AgentVersion, grader_version: AgentVersion
+    topic: str, subtext: str, *, version: AgentVersion, grader_version: AgentVersion
 ) -> tuple[Joke, StepCost, StepCost]:
-    """Return a joke communicating the subtext — along with the rationale
-    behind its construction — that passed grading (step 5, run on
-    `grader_version`), along with the generation step's usage and cost and
-    the grader's.
+    """Return a joke about the news topic communicating the subtext — along
+    with the rationale behind its construction — that passed grading (step 5,
+    run on `grader_version`), along with the generation step's usage and cost
+    and the grader's.
 
     A failed grading goes back to the model as a retry in the same
     conversation, so it sees its previous attempts and the feedback on them.
@@ -389,8 +398,8 @@ def generate_joke(
     a malformed structured response, so one of those costs a grading attempt.
     Running out raises RuntimeError.
     """
-    prompt = load_prompt("generate-joke.md", SUBTEXT=subtext)
-    deps = GradedRun(context=subtext, grader_version=grader_version)
+    prompt = load_prompt("generate-joke.md", TOPIC=topic, SUBTEXT=subtext)
+    deps = GradedJokeRun(topic=topic, subtext=subtext, grader_version=grader_version)
     model = StructuredOutputModel(infer_model(version.model))
 
     try:
@@ -503,9 +512,11 @@ def grade_subtext(topic: str, subtext: str, *, version: AgentVersion) -> tuple[G
     return result.output, _run_cost(result)
 
 
-def grade_joke(subtext: str, joke: str, *, version: AgentVersion) -> tuple[Grade, StepCost]:
+def grade_joke(
+    topic: str, subtext: str, joke: str, *, version: AgentVersion
+) -> tuple[Grade, StepCost]:
     """Evaluate a joke against the rules; a fail comes with feedback."""
-    prompt = load_prompt("evaluate-joke.md", SUBTEXT=subtext, JOKE=joke)
+    prompt = load_prompt("evaluate-joke.md", TOPIC=topic, SUBTEXT=subtext, JOKE=joke)
 
     result = _run_step(_grade_joke_agent, version, prompt)
     return result.output, _run_cost(result)
@@ -596,6 +607,7 @@ def main():
     logger.info(f"Subtext: {subtext.text}")
 
     joke, cost, grade_cost = generate_joke(
+        topic.text,
         subtext.text,
         version=versions["generate_joke"],
         grader_version=versions["grade_joke"],

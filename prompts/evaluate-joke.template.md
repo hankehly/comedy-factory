@@ -14,6 +14,10 @@ If the joke satisfies every rule, set `passed` to true and leave `feedback` empt
 
 Otherwise, set `passed` to false and set `feedback` to a bullet list naming each violated rule and giving specific feedback on what to correct.
 
+## Topic
+
+{TOPIC}
+
 ## Subtext
 
 {SUBTEXT}

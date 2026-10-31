@@ -1004,7 +1004,9 @@ def test_main_rejects_an_unknown_version_before_any_model_call(monkeypatch):
         return ModelResponse(parts=[TextPart(content="A fake topic.")])
 
     monkeypatch.setattr(settings, "describe_image_agent", "claud-opus")
-    message = "Unknown describe_image agent version 'claud-opus'; available: gemini-flash"
+    # The list of available versions is tested in test_agents.py, against a
+    # temporary agents folder; the committed one changes as versions are added.
+    message = "Unknown describe_image agent version 'claud-opus'; available: "
     with _find_topic_agent.override(model=FunctionModel(model, profile=_PROFILE), native_tools=[]):
         with pytest.raises(AgentVersionError, match=re.escape(message)):
             joke_generator.main()

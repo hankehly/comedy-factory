@@ -9,14 +9,12 @@ Claude, and a single run can mix providers across steps.
 
 ```
 agents/
-  agent-spec.schema.json    # pydantic-ai's spec schema, generated (see below)
   <step>/<version>.yaml     # one file per version
 ```
 
 A version file is a standard pydantic-ai agent spec, limited to two keys:
 
 ```yaml
-# yaml-language-server: $schema=../agent-spec.schema.json
 model: google-cloud:gemini-3.5-flash
 model_settings:
   thinking: high
@@ -48,24 +46,14 @@ settings only ever come from files in this folder.
   An unknown version name fails with the list of versions that exist. Each
   file must also pass these checks:
   - valid YAML, holding only `model` and `model_settings`
-  - values that match the schema, so `thinking: hgh` fails
+  - values that match pydantic-ai's agent spec schema, so `thinking: hgh` fails
   - setting keys that pydantic-ai defines for the model's provider, so
     `thinkng` fails
   - a model pydantic-ai can build, so an `anthropic:` model fails without
     `ANTHROPIC_API_KEY`
 - **In the tests (and so in CI)**, every committed file gets the same checks.
-  The tests also check that each step's default version exists, that every
-  folder here is a known step, and that the schema file is current.
-- **In the editor**, the first-line comment lets Red Hat's YAML extension for
-  VS Code autocomplete keys and flag bad values from the schema. It can't flag
-  a misspelled setting key, because the schema allows provider-specific ones;
-  the startup check and the tests do.
+  The tests also check that each step's default version exists and that every
+  folder here is a known step.
 
 **Known gap:** nothing offline can tell a misspelled model name such as
 `gemini-3.5-flsh` from a real one, so it fails at that step's first request.
-
-## Keeping the schema current
-
-`agent-spec.schema.json` is generated from the installed pydantic-ai. After
-upgrading pydantic-ai, run `just agent-schema`. A test fails until the
-committed copy matches.

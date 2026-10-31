@@ -1,18 +1,15 @@
 """Tests for loading and checking the per-step agent version files."""
 
-import json
 import re
 
 import pytest
 
 from comedy_factory.agent_versions import (
-    SCHEMA_FILENAME,
     STEPS,
     AgentVersionError,
     available_versions,
     check_version_file,
     load_version,
-    schema,
 )
 from comedy_factory.settings import settings
 
@@ -203,14 +200,8 @@ def test_initial_versions_carry_over_todays_settings(step, name, model, model_se
 )
 def test_committed_version_files_pass_the_checks(path):
     check_version_file(path.parent.name, path)
-    first_line = path.read_text().splitlines()[0]
-    assert first_line == "# yaml-language-server: $schema=../agent-spec.schema.json"
 
 
 def test_agents_folder_has_one_folder_per_step():
     assert {path.name for path in COMMITTED.iterdir() if path.is_dir()} == set(STEPS)
 
-
-def test_committed_schema_is_current():
-    committed = json.loads((COMMITTED / SCHEMA_FILENAME).read_text())
-    assert committed == schema(), "agents/agent-spec.schema.json is stale; run `just agent-schema`"

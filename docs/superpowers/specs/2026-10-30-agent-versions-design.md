@@ -26,7 +26,7 @@ providers across steps.
   environment variable can override one step's version, for testing and for
   trying a candidate version before committing it.
 - Model strings and model settings exist only in version files.
-- A broken version file or version name is caught in the editor, in CI, and at
+- A broken version file or version name is caught in CI and at
   pipeline start before any paid model call.
 - Every run records which version of each step it used.
 
@@ -91,7 +91,6 @@ Any of these would make the change a failure even if it works:
 
 ```
 agents/
-  agent-spec.schema.json        # generated from pydantic-ai, committed
   find_topic/
     gemini-flash.yaml
   generate_subtext/
@@ -114,11 +113,9 @@ agents/
 ```
 
 Each file is a standard pydantic-ai agent spec, the format
-`AgentSpec.from_file` loads, limited to `model` and `model_settings`. Its first
-line points at the committed schema so the editor can check it:
+`AgentSpec.from_file` loads, limited to `model` and `model_settings`:
 
 ```yaml
-# yaml-language-server: $schema=../agent-spec.schema.json
 model: google-cloud:gemini-3.5-flash
 model_settings:
   thinking: high
@@ -214,7 +211,8 @@ their gate. The tests are the gate for committed versions.
 
 One function checks a version file. `main()` runs it on each selected version,
 and the tests run it on every file under `agents/`. A version file must:
-- validate against `agent-spec.schema.json`, which catches unknown top-level
+- validate against pydantic-ai's agent spec schema
+  (`AgentSpec.model_json_schema_with_capabilities()`), which catches unknown top-level
   keys and bad values for known settings
 - contain only `model` and `model_settings`, with `model` set
 - use only `model_settings` keys that pydantic-ai defines for the model's
@@ -233,18 +231,16 @@ The tests also check that:
 - every step's default version exists
 - every folder under `agents/` must be a known step, which catches stray or
   misspelled step folders
-- `agent-spec.schema.json` must match a freshly generated schema, compared as
-  parsed JSON. After a pydantic-ai upgrade that changes the schema, the test
-  fails and says to run `just agent-schema`. That's a new `justfile` recipe
-  that regenerates the file.
 
 ### Editor checks
 
-With Red Hat's YAML extension for VS Code, the first-line comment gives
-autocomplete and inline errors from the same schema. Because the schema
-accepts any key inside `model_settings`, the editor won't flag a misspelled
-setting key. The startup check and the tests do. This is a convenience, not
-a correctness requirement.
+None. This design first committed the generated schema
+(`agents/agent-spec.schema.json`) so that VS Code's YAML extension could
+autocomplete and flag bad values while a version file is edited. The owner
+dropped it on 2026-10-31: nothing at run time or in the tests reads the file,
+and keeping a 90 KB generated copy current after every pydantic-ai upgrade
+wasn't worth the convenience. The startup check and the tests catch everything
+the editor did, and more.
 
 ### Known gaps
 
@@ -303,11 +299,13 @@ Decided by the owner:
   "works".
 - It must be easy to try (and later evaluate) candidates before deciding on
   one.
+- No committed schema file and no editor checks (decided after the build,
+  2026-10-31; see Editor checks).
 
 Proposed by Claude and accepted by the owner:
 - The `agents/` folder, version name = file name, named after the model with
   a suffix for variants.
-- pydantic-ai's spec file format and its generated JSON schema.
+- pydantic-ai's spec file format, validated with its generated JSON schema.
 - Image generation as an ordinary step. The `cloudflare:` model prefix
   replaces `image_provider` and `cloudflare_image_model`.
 - Recording versions in `metadata.json`.
@@ -328,7 +326,6 @@ Calls made while writing this spec, which the owner should check:
 - Unknown `COMEDY_FACTORY_*` environment variables fail at startup.
 - Misspelled model names are accepted as a known gap rather than adding a
   network preflight.
-- A committed schema file, a staleness test and the `just agent-schema` recipe.
 
 ## Left to the builder
 

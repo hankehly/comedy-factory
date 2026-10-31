@@ -94,14 +94,32 @@ def test_available_versions_lists_only_yaml_files(agents_dir):
         ("model_settings:\n  thinking: high\n", "'model' is required"),
         ("model:\n", "'model' is required"),
         (f"model: {GEMINI}\ninstructions: Be funny.\n", "unexpected keys: instructions"),
-        (f"model: {GEMINI}\nmodel_settings:\n  thinking: hgh\n", "'hgh'"),
+        ("model: 5\n", "model: Input should be a valid string"),
+        (f"model: {GEMINI}\nmodel_settings: nope\n", "model_settings: Input should be a valid dictionary"),
+        (
+            f"model: {GEMINI}\nmodel_settings:\n  1: high\n",
+            "model_settings.1.[key]: Input should be a valid string",
+        ),
+        (
+            f"model: {GEMINI}\nmodel_settings:\n  thinking: hgh\n",
+            "model_settings.thinking.literal['minimal','low','medium','high','xhigh']: "
+            "Input should be 'minimal', 'low', 'medium', 'high' or 'xhigh'",
+        ),
+        (
+            f'model: {GEMINI}\nmodel_settings:\n  temperature: "0.5"\n',
+            "model_settings.temperature: Input should be a valid number",
+        ),
         (
             f"model: {GEMINI}\nmodel_settings:\n  thinkng: high\n",
-            "unknown model_settings keys: thinkng",
+            "model_settings.thinkng: Extra inputs are not permitted",
         ),
         (
             f"model: {GEMINI}\nmodel_settings:\n  anthropic_betas: []\n",
-            "unknown model_settings keys: anthropic_betas",
+            "model_settings.anthropic_betas: Extra inputs are not permitted",
+        ),
+        (
+            f"model: {GEMINI}\nmodel_settings:\n  google_thinking_config:\n    includ_thoughts: true\n",
+            "model_settings.google_thinking_config.includ_thoughts: Extra inputs are not permitted",
         ),
         ("model: nope:some-model\n", "can't be built"),
     ],
@@ -126,8 +144,16 @@ def test_check_allows_provider_specific_settings(agents_dir):
         "claude",
         "model: anthropic:claude-opus-5-5\nmodel_settings:\n  anthropic_betas: []\n",
     )
-    assert check_version_file("generate_joke", gemini).model == GEMINI
-    assert check_version_file("generate_joke", claude).model == "anthropic:claude-opus-5-5"
+    gemini_spec = check_version_file("generate_joke", gemini)
+    claude_spec = check_version_file("generate_joke", claude)
+    assert (gemini_spec.model, gemini_spec.model_settings) == (
+        GEMINI,
+        {"google_thinking_config": {"include_thoughts": True}},
+    )
+    assert (claude_spec.model, claude_spec.model_settings) == (
+        "anthropic:claude-opus-5-5",
+        {"anthropic_betas": []},
+    )
 
 
 def test_check_allows_only_common_settings_for_other_providers(agents_dir):
@@ -141,7 +167,9 @@ def test_check_allows_only_common_settings_for_other_providers(agents_dir):
         "model: test\nmodel_settings:\n  google_thinking_config:\n    include_thoughts: true\n",
     )
     assert check_version_file("generate_joke", common).model == "test"
-    with pytest.raises(AgentVersionError, match="unknown model_settings keys: google_thinking_config"):
+    with pytest.raises(
+        AgentVersionError, match="model_settings.google_thinking_config: Extra inputs are not permitted"
+    ):
         check_version_file("generate_joke", google)
 
 
@@ -205,3 +233,20 @@ def test_committed_version_files_pass_the_checks(path):
 def test_agents_folder_has_one_folder_per_step():
     assert {path.name for path in COMMITTED.iterdir() if path.is_dir()} == set(STEPS)
 
+
+
+def test_check_accepts_enum_settings_written_as_strings(agents_dir):
+    # A YAML file can only spell an enum setting by its value; the check must
+    # accept that (strict JSON-mode validation does, strict Python mode not).
+    path = write_version(
+        agents_dir,
+        "generate_joke",
+        "safety",
+        f"model: {GEMINI}\nmodel_settings:\n  google_safety_settings:\n"
+        "    - category: HARM_CATEGORY_HATE_SPEECH\n      threshold: BLOCK_NONE\n",
+    )
+    assert check_version_file("generate_joke", path).model_settings == {
+        "google_safety_settings": [
+            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"}
+        ]
+    }

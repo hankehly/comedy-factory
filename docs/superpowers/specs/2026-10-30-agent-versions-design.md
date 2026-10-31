@@ -50,7 +50,8 @@ Any of these would make the change a failure even if it works:
   whether through an env var, a CLI flag or a settings field that holds a
   model name.
 - A hand-rolled config format or validator where pydantic-ai already provides
-  one: the agent spec file format and its JSON schema.
+  one: the agent spec file format, and its settings classes for validating
+  `model_settings`.
 - A mistyped version name, broken version file or misspelled setting that
   silently falls back to something else, or that only surfaces after earlier
   steps have already spent money. Misspelled model names are the one accepted
@@ -64,14 +65,14 @@ Any of these would make the change a failure even if it works:
 - Tests never call real models: `tests/conftest.py` sets
   `models.ALLOW_MODEL_REQUESTS = False`. CI has no model credentials.
 - pydantic-ai's `AgentSpec` silently ignores unknown keys when it loads a
-  file, and it doesn't validate `model_settings`. The JSON schema from
-  `AgentSpec.model_json_schema_with_capabilities()` rejects unknown top-level
-  keys, and bad values for the settings it knows, like `thinking: hgh`. To let
-  provider-specific settings (`google_*`, `anthropic_*`) through, it accepts
-  any key inside `model_settings`. So a misspelled setting such as
-  `thinkng: high` passes the schema and is silently ignored at run time.
-  Validation uses the schema plus a key check against pydantic-ai's settings
-  classes (see Version-file checks).
+  file, and it doesn't validate `model_settings`, so a misspelled setting such
+  as `thinkng: high`, or a bad value like `thinking: hgh`, would be silently
+  ignored or fail only at run time. `model_settings` are therefore validated
+  with pydantic against pydantic-ai's settings class for the model's provider
+  (see Version-file checks). (This design first used `jsonschema` with
+  `AgentSpec.model_json_schema_with_capabilities()`; that schema accepts any
+  key inside `model_settings`, so it needed a key check of our own besides.
+  The pydantic validation replaced both on 2026-10-31.)
 - `infer_model` only checks a model string's provider prefix:
   `google-cloud:gemini-3.5-flsh` builds fine and fails at its first request.
   pydantic-ai's `KnownModelName` list can't serve as an allowlist, because it
@@ -211,15 +212,17 @@ their gate. The tests are the gate for committed versions.
 
 One function checks a version file. `main()` runs it on each selected version,
 and the tests run it on every file under `agents/`. A version file must:
-- validate against pydantic-ai's agent spec schema
-  (`AgentSpec.model_json_schema_with_capabilities()`), which catches unknown top-level
-  keys and bad values for known settings
 - contain only `model` and `model_settings`, with `model` set
-- use only `model_settings` keys that pydantic-ai defines for the model's
-  provider. Those are the common `ModelSettings` keys plus the provider's
-  settings class: `GoogleModelSettings` for `google-cloud:` models and
+- pass `AgentSpec` validation, so `model` is text and `model_settings` a
+  mapping
+- have `model_settings` that pydantic-ai's settings class for the model's
+  provider accepts, with unknown keys forbidden: the common `ModelSettings`
+  keys plus `GoogleModelSettings` for `google-cloud:` models and
   `AnthropicModelSettings` for `anthropic:` models. This catches misspelled
-  keys like `thinkng`.
+  keys like `thinkng` (nested provider settings included) and bad values like
+  `thinking: hgh`. Validation is strict: a quoted number such as
+  `temperature: "0.5"` fails rather than being converted, so the file's own
+  values are what runs. Errors name the setting, never echo its value.
 - name a model that can be built, meaning `infer_model` succeeds. The tests
   set dummy API keys. At startup, this also catches a missing
   `ANTHROPIC_API_KEY` for a Claude version.
@@ -272,8 +275,6 @@ name, model and model settings that ran:
 - pydantic-ai's `spec` extra, for example `pydantic-ai-slim[spec]` with the
   same version floor as `pydantic-ai`. It declares PyYAML, which
   `AgentSpec.from_file` needs and which only arrives transitively today.
-- `jsonschema`, as a runtime dependency because the startup check uses it. It
-  only arrives transitively today, through `mcp`.
 - `uv.lock` updated to match.
 
 ### Docs
@@ -305,21 +306,21 @@ Decided by the owner:
 Proposed by Claude and accepted by the owner:
 - The `agents/` folder, version name = file name, named after the model with
   a suffix for variants.
-- pydantic-ai's spec file format, validated with its generated JSON schema.
+- pydantic-ai's spec file format, with `model_settings` validated against
+  pydantic-ai's provider settings classes.
 - Image generation as an ordinary step. The `cloudflare:` model prefix
   replaces `image_provider` and `cloudflare_image_model`.
 - Recording versions in `metadata.json`.
 - An initial set of today's Gemini configurations plus FLUX, with no Claude
   versions yet.
-- pydantic-ai's `spec` extra and `jsonschema` as declared dependencies.
+- pydantic-ai's `spec` extra as a declared dependency.
 
 Calls made while writing this spec, which the owner should check:
 - Version files are limited to `model` and `model_settings`.
 - Overrides take a version name only, never a path.
 - A new `agents_dir` setting.
 - `main()` runs the full version-file checks on every selected version before
-  the first model call, not just the name check. As a result `jsonschema` is
-  a runtime dependency.
+  the first model call, not just the name check.
 - `model_settings` keys are checked against pydantic-ai's provider settings
   classes.
 - `cloudflare:` versions take no model settings.

@@ -46,9 +46,9 @@ settings only ever come from files in this folder.
   An unknown version name fails with the list of versions that exist. Each
   file must also pass these checks:
   - valid YAML, holding only `model` and `model_settings`
-  - values that match pydantic-ai's agent spec schema, so `thinking: hgh` fails
-  - setting keys that pydantic-ai defines for the model's provider, so
-    `thinkng` fails
+  - settings that pydantic-ai defines for the model's provider, with values of
+    the right type, so `thinkng: high`, `thinking: hgh` and a quoted number
+    like `temperature: "0.5"` all fail, inside nested provider settings too
   - a model pydantic-ai can build, so an `anthropic:` model fails without
     `ANTHROPIC_API_KEY`
 - **In the tests (and so in CI)**, every committed file gets the same checks.

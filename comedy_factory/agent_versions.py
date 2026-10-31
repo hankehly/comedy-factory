@@ -2,14 +2,14 @@
 can run. A version is one pydantic-ai agent spec file holding a model and its
 model settings, at agents/<step>/<version>.yaml (see agents/README.md)."""
 
+import json
 from dataclasses import dataclass
 from functools import cache
 from pathlib import Path
 from typing import Any, cast
 
-import jsonschema
 import yaml
-from jsonschema.protocols import Validator
+from pydantic import ConfigDict, TypeAdapter, ValidationError, with_config
 from pydantic_ai import AgentSpec
 from pydantic_ai.models import Model, infer_model
 from pydantic_ai.models.anthropic import AnthropicModel, AnthropicModelSettings
@@ -40,11 +40,32 @@ build; only generate_image versions may use one."""
 # change the step's prompt or tools. Versions hold only these keys.
 _VERSION_KEYS = {"model", "model_settings"}
 
-# pydantic-ai's settings TypedDict for each model class; each includes the
-# common ModelSettings keys, and other model classes get only those.
+# pydantic-ai's settings TypedDicts, made to reject keys they don't define:
+# AgentSpec leaves model_settings unchecked and pydantic-ai ignores unknown
+# keys, so a misspelled setting would otherwise silently not apply. (The
+# `timeout` setting's type, httpx.Timeout, has no pydantic schema.)
+_STRICT_SETTINGS = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
+
+
+@with_config(_STRICT_SETTINGS)
+class _ModelSettings(ModelSettings, total=False):
+    """The settings every provider accepts."""
+
+
+@with_config(_STRICT_SETTINGS)
+class _GoogleModelSettings(GoogleModelSettings, total=False):
+    """The common settings plus the `google_*` ones."""
+
+
+@with_config(_STRICT_SETTINGS)
+class _AnthropicModelSettings(AnthropicModelSettings, total=False):
+    """The common settings plus the `anthropic_*` ones."""
+
+
+# The settings class for each model class; other models get the common ones.
 _PROVIDER_SETTINGS: dict[type[Model], Any] = {
-    GoogleModel: GoogleModelSettings,
-    AnthropicModel: AnthropicModelSettings,
+    GoogleModel: _GoogleModelSettings,
+    AnthropicModel: _AnthropicModelSettings,
 }
 
 
@@ -72,14 +93,6 @@ class AgentVersion:
     def as_metadata(self) -> dict[str, Any]:
         """The version as an asset bundle's metadata records it."""
         return {"version": self.name, "model": self.model, "model_settings": self.model_settings}
-
-
-@cache
-def _schema_validator() -> Validator:
-    """A validator for pydantic-ai's JSON schema of agent spec files, built
-    once: jsonschema.validate() would re-check the large schema every call."""
-    schema = AgentSpec.model_json_schema_with_capabilities()
-    return jsonschema.validators.validator_for(schema)(schema)
 
 
 def available_versions(step: str) -> list[str]:
@@ -122,31 +135,53 @@ def check_version_file(step: str, path: Path) -> AgentSpec:
     if not data.get("model"):
         raise error("'model' is required")
     try:
-        _schema_validator().validate(data)
-    except jsonschema.ValidationError as e:
-        raise error(e.message) from e
+        spec = AgentSpec.model_validate(data)
+    except ValidationError as e:
+        raise error(_describe(e)) from e
 
-    model_name: str = data["model"]
-    model_settings: dict[str, Any] = data.get("model_settings") or {}
+    model_name = cast(str, spec.model)
     if model_name.startswith(CLOUDFLARE_PREFIX):
         if step != "generate_image":
             raise error("cloudflare: models are only for generate_image")
-        if model_settings:
+        if spec.model_settings:
             raise error("cloudflare: models take no model_settings")
-    else:
-        try:
-            model = infer_model(model_name)
-        except Exception as e:
-            raise error(f"model {model_name!r} can't be built: {e}") from e
-        if unknown := model_settings.keys() - _settings_keys(model):
-            raise error(f"unknown model_settings keys: {', '.join(sorted(unknown))}")
-    return AgentSpec.model_validate(data)
+        return spec
+    try:
+        model = infer_model(model_name)
+    except Exception as e:
+        raise error(f"model {model_name!r} can't be built: {e}") from e
+    try:
+        _check_settings(model, spec.model_settings or {})
+    except ValidationError as e:
+        raise error(_describe(e, "model_settings")) from e
+    return spec
 
 
-def _settings_keys(model: Model) -> frozenset[str]:
-    """The model_settings keys pydantic-ai defines for the model's provider."""
+def _check_settings(model: Model, model_settings: dict[str, Any]) -> None:
+    """Validate model_settings against pydantic-ai's settings class for the
+    model's provider; raises ValidationError.
+
+    Validated as JSON in strict mode: YAML values are JSON values, and strict
+    JSON validation rejects coercions (a quoted number) while still accepting
+    enum values written as strings. The file's own values are what runs."""
     settings_class = next(
         (cls for model_class, cls in _PROVIDER_SETTINGS.items() if isinstance(model, model_class)),
-        ModelSettings,
+        _ModelSettings,
     )
-    return settings_class.__optional_keys__ | settings_class.__required_keys__
+    _settings_adapter(settings_class).validate_json(
+        json.dumps(model_settings, default=str), strict=True
+    )
+
+
+@cache
+def _settings_adapter(settings_class: Any) -> TypeAdapter[Any]:
+    return TypeAdapter(settings_class)
+
+
+def _describe(error: ValidationError, *prefix: str) -> str:
+    """pydantic's errors as `field: message` pairs, leaving out the input
+    values pydantic would otherwise echo."""
+    return "; ".join(
+        f"{'.'.join(map(str, (*prefix, *detail['loc'])))}: {detail['msg']}"
+        for detail in error.errors()
+    )

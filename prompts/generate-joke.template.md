@@ -64,6 +64,10 @@ Directing attention to the wrong thing.
 
 Jokes about jokes or comedy itself.
 
+## Topic
+
+{TOPIC}
+
 ## Subtext
 
 {SUBTEXT}

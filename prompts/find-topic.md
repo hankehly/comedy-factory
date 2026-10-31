@@ -8,7 +8,7 @@ Your task is to scan current news using your search tools and return the single 
 
 The topic must:
 
-* Be a single factual sentence summarizing one real news story from the past week, including the concrete details (who, what, where) a writer would need. Never editorialize, speculate, or attempt humor — report it straight.
+* Be a single factual sentence summarizing one real news story from the past week, including the concrete details (who, what, where) a writer would need. Identify each company, agency, or person by what they are, unless the name is a household word (e.g. "Canadian wireless carrier Rogers Communications"). Never editorialize, speculate, or attempt humor — report it straight.
 * Be accessible — a widely reported story about subject matter that just about anyone can understand and relate to, with no niche expertise required.
 * Contain a deserving target: the comfortable — the status quo, an entrenched power, or an authority, no matter how low-level — doing something ripe for ridicule. Skip stories whose only available target is the downtrodden or victims of a tragedy.
 * Be fresh — avoid comedy-cliché subject matter that has been joked about endlessly.

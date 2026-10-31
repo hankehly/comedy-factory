@@ -1,0 +1,3 @@
+model: google-cloud:gemini-3.5-flash
+model_settings:
+  thinking: medium

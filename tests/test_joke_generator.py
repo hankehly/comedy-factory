@@ -4,20 +4,23 @@ Model stubbing follows pydantic-ai's recommended seams:
 
 * The scan-news Agent is swapped via `agent.override(model=...)`; its WebSearch
   native tool is overridden away because TestModel can't emulate built-in tools.
-* The other steps' agents read their model from the step's config (e.g.
-  `settings.generate_subtext.model`) at call time, so tests monkeypatch that
-  attribute with a TestModel/FunctionModel instance.
+* The other steps run on a committed agent version (see `_version`), and
+  their agent's model is swapped the same way: `agent.override(model=...)`
+  takes precedence over the version's model, while the version's model
+  settings still apply.
 """
 
 import base64
 import io
 import json
+import re
 from collections.abc import Callable
+from contextlib import ExitStack
 from datetime import datetime
 
 import pytest
 from PIL import Image, ImageFont
-from pydantic_ai import NativeOutput, PromptedOutput
+from pydantic_ai import AgentSpec, NativeOutput, PromptedOutput
 from pydantic_ai.messages import BinaryImage, FilePart, ModelResponse, TextPart
 from pydantic_ai.models import infer_model
 from pydantic_ai.models.function import AgentInfo, FunctionModel
@@ -25,6 +28,7 @@ from pydantic_ai.models.test import TestModel
 from pydantic_ai.profiles import ModelProfile
 
 from comedy_factory import joke_generator, recaption
+from comedy_factory.agents import STEPS, AgentVersion, AgentVersionError, load_version
 from comedy_factory.captioning import _wrap_caption, render_caption
 from comedy_factory.joke_generator import (
     Grade,
@@ -35,9 +39,17 @@ from comedy_factory.joke_generator import (
     StepCost,
     Subtext,
     Topic,
+    _describe_image_agent,
     _find_topic_agent,
+    _generate_joke_agent,
+    _generate_subtext_agent,
+    _google_image_agent,
+    _grade_joke_agent,
+    _grade_subtext_agent,
     _output_spec,
     _recent_topics,
+    _rephrase_joke_agent,
+    _write_image_prompt_agent,
     describe_image,
     find_topic,
     generate_image,
@@ -64,6 +76,12 @@ _PROFILE = ModelProfile(
 def canned_model(text: str) -> TestModel:
     """A model that always answers with `text`."""
     return TestModel(custom_output_text=text, profile=_PROFILE)
+
+
+def _version(step: str, name: str | None = None) -> AgentVersion:
+    """A committed version of `step`: its configured default unless `name` is
+    given."""
+    return load_version(step, name or getattr(settings, f"{step}_agent"))
 
 
 def _tiny_jpeg(width: int = 64, height: int = 48) -> bytes:
@@ -118,7 +136,7 @@ def image_api_calls(monkeypatch):
 def test_find_topic_returns_bare_topic():
     canned = "* A fake topic.\n\nSome trailing explanation."
     with _find_topic_agent.override(model=canned_model(canned), native_tools=[]):
-        topic, _ = find_topic()
+        topic, _ = find_topic(version=_version("find_topic"))
     assert topic.text == "A fake topic."
     assert topic.source_url is None
 
@@ -126,7 +144,7 @@ def test_find_topic_returns_bare_topic():
 def test_find_topic_parses_source_url():
     canned = "A fake topic.\nhttps://example.com/story"
     with _find_topic_agent.override(model=canned_model(canned), native_tools=[]):
-        topic, _ = find_topic()
+        topic, _ = find_topic(version=_version("find_topic"))
     assert topic.text == "A fake topic."
     assert topic.source_url == "https://example.com/story"
 
@@ -134,7 +152,7 @@ def test_find_topic_parses_source_url():
 def test_find_topic_ignores_url_ordering():
     canned = "https://example.com/story\nA fake topic."
     with _find_topic_agent.override(model=canned_model(canned), native_tools=[]):
-        topic, _ = find_topic()
+        topic, _ = find_topic(version=_version("find_topic"))
     assert topic.text == "A fake topic."
     assert topic.source_url == "https://example.com/story"
 
@@ -159,7 +177,7 @@ def test_find_topic_feeds_recent_topics_to_prompt(monkeypatch, tmp_path):
     with _find_topic_agent.override(
         model=FunctionModel(model, profile=_PROFILE), native_tools=[]
     ):
-        topic, _ = find_topic()
+        topic, _ = find_topic(version=_version("find_topic"))
 
     assert topic.text == "A fresh topic."
     [prompt] = prompts
@@ -171,7 +189,7 @@ def test_find_topic_rejects_output_without_topic():
     canned = "https://example.com/story\n\n"
     with _find_topic_agent.override(model=canned_model(canned), native_tools=[]):
         with pytest.raises(RuntimeError, match="no topic"):
-            find_topic()
+            find_topic(version=_version("find_topic"))
 
 
 def test_recent_topics_skips_unreadable_bundles_and_caps_the_count(monkeypatch, tmp_path):
@@ -199,48 +217,52 @@ def test_recent_topics_skips_unreadable_bundles_and_caps_the_count(monkeypatch, 
     assert _recent_topics() == ["A newer story.", "An old story."]
 
 
-def test_generate_subtext(monkeypatch):
+def test_generate_subtext():
     canned = Subtext(text="A fake subtext.").model_dump_json()
-    monkeypatch.setattr(settings.generate_subtext, "model", canned_model(canned))
-    subtext, history, cost = generate_subtext("A fake topic.")
+    with _generate_subtext_agent.override(model=canned_model(canned)):
+        subtext, history, cost = generate_subtext(
+            "A fake topic.", version=_version("generate_subtext")
+        )
     assert subtext.text == "A fake subtext."
     assert len(history) == 2  # templated prompt + model response
     assert isinstance(cost, StepCost)
 
 
-def test_generate_subtext_retry_extends_history(monkeypatch):
+def test_generate_subtext_retry_extends_history():
     canned = Subtext(text="A better subtext.").model_dump_json()
-    monkeypatch.setattr(settings.generate_subtext, "model", canned_model(canned))
-    _, history, _ = generate_subtext("A fake topic.")
-    subtext, history, _ = generate_subtext(
-        "A fake topic.", history=history, feedback="* Too wordy."
-    )
+    version = _version("generate_subtext")
+    with _generate_subtext_agent.override(model=canned_model(canned)):
+        _, history, _ = generate_subtext("A fake topic.", version=version)
+        subtext, history, _ = generate_subtext(
+            "A fake topic.", history=history, feedback="* Too wordy.", version=version
+        )
     assert subtext.text == "A better subtext."
     assert len(history) == 4  # prompt, first attempt, feedback, rewrite
     assert "Too wordy" in history[2].parts[0].content
 
 
-def test_generate_joke(monkeypatch):
+def test_generate_joke():
     canned = Joke(text="A fake joke.", rationale="Irony.").model_dump_json()
-    monkeypatch.setattr(settings.generate_joke, "model", canned_model(canned))
-    joke, history, _ = generate_joke("A fake subtext.")
+    with _generate_joke_agent.override(model=canned_model(canned)):
+        joke, history, _ = generate_joke("A fake subtext.", version=_version("generate_joke"))
     assert joke.text == "A fake joke."
     assert joke.rationale == "Irony."
     assert len(history) == 2
 
 
-def test_write_image_prompt(monkeypatch):
+def test_write_image_prompt():
     canned = ImagePrompt(text="A fake image prompt.").model_dump_json()
-    monkeypatch.setattr(settings.write_image_prompt, "model", canned_model(canned))
     joke = Joke(text="A fake joke.", rationale="Irony.")
-    image_prompt, _ = write_image_prompt(joke)
+    with _write_image_prompt_agent.override(model=canned_model(canned)):
+        image_prompt, _ = write_image_prompt(joke, version=_version("write_image_prompt"))
     assert image_prompt.text == "A fake image prompt."
 
 
-def test_rephrase_joke(monkeypatch):
+def test_rephrase_joke():
     canned = Rephrasings(texts=["Alt one.", "Alt two."]).model_dump_json()
-    monkeypatch.setattr(settings.rephrase_joke, "model", canned_model(canned))
-    rephrasings, _ = rephrase_joke(Joke(text="A fake joke.", rationale="Irony."))
+    joke = Joke(text="A fake joke.", rationale="Irony.")
+    with _rephrase_joke_agent.override(model=canned_model(canned)):
+        rephrasings, _ = rephrase_joke(joke, version=_version("rephrase_joke"))
     assert rephrasings.texts == ["Alt one.", "Alt two."]
 
 
@@ -253,11 +275,10 @@ def test_rephrase_joke_requests_configured_count(monkeypatch):
         return ModelResponse(parts=[TextPart(content=text)])
 
     monkeypatch.setattr(settings, "rephrasing_count", 5)
-    monkeypatch.setattr(
-        settings.rephrase_joke, "model", FunctionModel(model, profile=_PROFILE)
-    )
 
-    rephrase_joke(Joke(text="A fake joke.", rationale="Irony."))
+    joke = Joke(text="A fake joke.", rationale="Irony.")
+    with _rephrase_joke_agent.override(model=FunctionModel(model, profile=_PROFILE)):
+        rephrase_joke(joke, version=_version("rephrase_joke"))
 
     [prompt] = prompts
     assert "write 5 alternative phrasings" in prompt
@@ -265,18 +286,19 @@ def test_rephrase_joke_requests_configured_count(monkeypatch):
 
 
 def test_generate_image_cloudflare(monkeypatch, image_api_calls):
-    monkeypatch.setattr(settings, "image_provider", "cloudflare")
     monkeypatch.setattr(settings, "cloudflare_account_id", "test-account")
     monkeypatch.setattr(settings, "cloudflare_api_token", "test-token")
 
-    image, cost = generate_image(ImagePrompt(text="A fake image prompt."))
+    image, cost = generate_image(
+        ImagePrompt(text="A fake image prompt."), version=_version("generate_image", "flux-schnell")
+    )
 
     assert image == FAKE_IMAGE_BYTES
     # Cloudflare reports no usage, so the step's cost is empty/unknown.
     assert cost == StepCost()
     (url, kwargs), = image_api_calls
     assert "test-account" in url
-    assert url.endswith(settings.cloudflare_image_model)
+    assert url.endswith("/ai/run/@cf/black-forest-labs/flux-1-schnell")
     assert kwargs["headers"]["Authorization"] == "Bearer test-token"
     assert kwargs["json"] == {"prompt": "A fake image prompt."}
 
@@ -286,13 +308,13 @@ def test_generate_image_cloudflare_reports_api_failure(monkeypatch):
     monkeypatch.setattr(
         joke_generator.httpx, "post", lambda url, **kwargs: _FakeCloudflareResponse(payload)
     )
-    monkeypatch.setattr(settings, "image_provider", "cloudflare")
+    version = _version("generate_image", "flux-schnell")
 
     with pytest.raises(RuntimeError, match="Image generation failed.*Capacity exceeded"):
-        generate_image(ImagePrompt(text="A fake image prompt."))
+        generate_image(ImagePrompt(text="A fake image prompt."), version=version)
 
 
-def test_generate_image_google(monkeypatch):
+def test_generate_image_google():
     def model(messages: list, info: AgentInfo) -> ModelResponse:
         assert info.model_request_parameters.allow_image_output
         return ModelResponse(
@@ -303,14 +325,14 @@ def test_generate_image_google(monkeypatch):
             ]
         )
 
-    monkeypatch.setattr(settings, "image_provider", "google")
-    monkeypatch.setattr(settings.google_image, "model", FunctionModel(model, profile=_PROFILE))
-
-    image, _ = generate_image(ImagePrompt(text="A fake image prompt."))
+    with _google_image_agent.override(model=FunctionModel(model, profile=_PROFILE)):
+        image, _ = generate_image(
+            ImagePrompt(text="A fake image prompt."), version=_version("generate_image")
+        )
     assert image == FAKE_IMAGE_BYTES
 
 
-def test_describe_image_sends_image_to_model(monkeypatch):
+def test_describe_image_sends_image_to_model():
     contents = []
 
     def model(messages: list, info: AgentInfo) -> ModelResponse:
@@ -318,11 +340,8 @@ def test_describe_image_sends_image_to_model(monkeypatch):
         text = ImageDescription(text="A gray rectangle.").model_dump_json()
         return ModelResponse(parts=[TextPart(content=text)])
 
-    monkeypatch.setattr(
-        settings.describe_image, "model", FunctionModel(model, profile=_PROFILE)
-    )
-
-    description, _ = describe_image(FAKE_IMAGE_BYTES)
+    with _describe_image_agent.override(model=FunctionModel(model, profile=_PROFILE)):
+        description, _ = describe_image(FAKE_IMAGE_BYTES, version=_version("describe_image"))
 
     assert description.text == "A gray rectangle."
     [(prompt, image)] = contents
@@ -331,7 +350,7 @@ def test_describe_image_sends_image_to_model(monkeypatch):
     assert image.media_type == "image/jpeg"
 
 
-def test_describe_image_detects_png(monkeypatch):
+def test_describe_image_detects_png():
     contents = []
 
     def model(messages: list, info: AgentInfo) -> ModelResponse:
@@ -339,13 +358,10 @@ def test_describe_image_detects_png(monkeypatch):
         text = ImageDescription(text="A gray rectangle.").model_dump_json()
         return ModelResponse(parts=[TextPart(content=text)])
 
-    monkeypatch.setattr(
-        settings.describe_image, "model", FunctionModel(model, profile=_PROFILE)
-    )
-
     buffer = io.BytesIO()
     Image.new("RGB", (64, 48), "gray").save(buffer, format="PNG")
-    describe_image(buffer.getvalue())
+    with _describe_image_agent.override(model=FunctionModel(model, profile=_PROFILE)):
+        describe_image(buffer.getvalue(), version=_version("describe_image"))
 
     [(_, image)] = contents
     assert image.media_type == "image/png"
@@ -463,43 +479,51 @@ def test_recaption_requires_original_image(tmp_path):
         recaption.main([str(tmp_path), "A caption."])
 
 
-def test_grade_subtext_pass(monkeypatch):
+def test_grade_subtext_pass():
     canned = Grade(passed=True).model_dump_json()
-    monkeypatch.setattr(settings.grade_subtext, "model", canned_model(canned))
-    grade, _ = grade_subtext("A fake topic.", "A fake subtext.")
+    with _grade_subtext_agent.override(model=canned_model(canned)):
+        grade, _ = grade_subtext(
+            "A fake topic.", "A fake subtext.", version=_version("grade_subtext")
+        )
     assert grade.passed
     assert grade.feedback == ""
 
 
-def test_grade_subtext_fail(monkeypatch):
+def test_grade_subtext_fail():
     canned = Grade(passed=False, feedback="* Not a simple sentence.").model_dump_json()
-    monkeypatch.setattr(settings.grade_subtext, "model", canned_model(canned))
-    grade, _ = grade_subtext("A fake topic.", "A fake subtext.")
+    with _grade_subtext_agent.override(model=canned_model(canned)):
+        grade, _ = grade_subtext(
+            "A fake topic.", "A fake subtext.", version=_version("grade_subtext")
+        )
     assert not grade.passed
     assert grade.feedback == "* Not a simple sentence."
 
 
-def test_grade_joke_fail(monkeypatch):
+def test_grade_joke_fail():
     canned = Grade(passed=False, feedback="* The funny part is not last.").model_dump_json()
-    monkeypatch.setattr(settings.grade_joke, "model", canned_model(canned))
-    grade, _ = grade_joke("A fake subtext.", "A fake joke.")
+    with _grade_joke_agent.override(model=canned_model(canned)):
+        grade, _ = grade_joke("A fake subtext.", "A fake joke.", version=_version("grade_joke"))
     assert not grade.passed
     assert grade.feedback == "* The funny part is not last."
 
 
-def test_steps_send_their_configured_model_settings(monkeypatch):
+def test_steps_send_their_configured_model_settings():
     seen = []
 
     def model(messages: list, info: AgentInfo) -> ModelResponse:
         seen.append(info)
         return ModelResponse(parts=[TextPart(content=Grade(passed=True).model_dump_json())])
 
-    monkeypatch.setattr(settings.grade_joke, "model", FunctionModel(model, profile=_PROFILE))
-    monkeypatch.setattr(
-        settings.grade_joke, "model_settings", {"thinking": "low", "temperature": 0.0}
+    version = AgentVersion(
+        "grade_joke",
+        "test",
+        AgentSpec(
+            model="google-cloud:gemini-3.5-flash",
+            model_settings={"thinking": "low", "temperature": 0.0},
+        ),
     )
-
-    grade_joke("A fake subtext.", "A fake joke.")
+    with _grade_joke_agent.override(model=FunctionModel(model, profile=_PROFILE)):
+        grade_joke("A fake subtext.", "A fake joke.", version=version)
 
     [info] = seen
     # pydantic-ai resolves the unified `thinking` setting into the request
@@ -508,18 +532,20 @@ def test_steps_send_their_configured_model_settings(monkeypatch):
     assert info.model_settings == {"temperature": 0.0}
 
 
-def test_structured_steps_fall_back_to_prompted_output(monkeypatch):
+def test_structured_steps_fall_back_to_prompted_output():
     seen = []
 
     def model(messages: list, info: AgentInfo) -> ModelResponse:
         seen.append(info)
         return ModelResponse(parts=[TextPart(content=Grade(passed=True).model_dump_json())])
 
-    # A model without native (JSON-schema) output support, like Claude Haiku.
-    profile = ModelProfile(supports_json_schema_output=False)
-    monkeypatch.setattr(settings.grade_joke, "model", FunctionModel(model, profile=profile))
-
-    grade, _ = grade_joke("A fake subtext.", "A fake joke.")
+    # Claude Haiku has no native (JSON-schema) output, so the step falls back
+    # to prompted output; the stub answers in Haiku's place.
+    version = AgentVersion(
+        "grade_joke", "claude-haiku", AgentSpec(model="anthropic:claude-haiku-5-5")
+    )
+    with _grade_joke_agent.override(model=FunctionModel(model, profile=_PROFILE)):
+        grade, _ = grade_joke("A fake subtext.", "A fake joke.", version=version)
 
     assert grade.passed
     [info] = seen
@@ -582,6 +608,7 @@ def test_save_asset(monkeypatch, tmp_path):
             "generate_image": StepCost(),
         },
         evaluation=Grade(passed=True),
+        versions={"generate_joke": _version("generate_joke")},
     )
 
     assert bundle_dir.parent == tmp_path / "output"
@@ -606,22 +633,32 @@ def test_save_asset(monkeypatch, tmp_path):
         "output_tokens": 20,
         "usd": 0.001,
     }
+    assert metadata["agents"] == {
+        "generate_joke": {
+            "version": "gemini-flash",
+            "model": "google-cloud:gemini-3.5-flash",
+            "model_settings": {"thinking": "high"},
+        }
+    }
     assert "created_at" in metadata
 
 
-def _set_all_step_models(monkeypatch, model):
-    """Point every agent step's model (except find_topic's) at the same stub."""
-    for name in (
-        "generate_subtext",
-        "grade_subtext",
-        "generate_joke",
-        "grade_joke",
-        "rephrase_joke",
-        "write_image_prompt",
-        "describe_image",
-        "google_image",
+def _override_step_models(model) -> ExitStack:
+    """Swap the same stub model into every step's agent except find_topic's,
+    whose tests also override away its native tools."""
+    stack = ExitStack()
+    for agent in (
+        _generate_subtext_agent,
+        _grade_subtext_agent,
+        _generate_joke_agent,
+        _grade_joke_agent,
+        _rephrase_joke_agent,
+        _write_image_prompt_agent,
+        _google_image_agent,
+        _describe_image_agent,
     ):
-        monkeypatch.setattr(getattr(settings, name), "model", model)
+        stack.enter_context(agent.override(model=model))
+    return stack
 
 
 _FAKE_IMAGE_RESPONSE = ModelResponse(
@@ -663,9 +700,11 @@ def _pipeline_model(
 
 
 def test_main_smoke(monkeypatch, tmp_path, log_output):
-    _set_all_step_models(monkeypatch, FunctionModel(_pipeline_model(), profile=_PROFILE))
     monkeypatch.setattr(settings, "output_dir", tmp_path / "output")
-    with _find_topic_agent.override(model=canned_model("A fake topic."), native_tools=[]):
+    with (
+        _override_step_models(FunctionModel(_pipeline_model(), profile=_PROFILE)),
+        _find_topic_agent.override(model=canned_model("A fake topic."), native_tools=[]),
+    ):
         joke_generator.main()
 
     out = "".join(log_output)
@@ -704,9 +743,11 @@ def test_main_smoke(monkeypatch, tmp_path, log_output):
         "describe_image",
     }
     assert set(metadata["costs"]["total"]) == {"input_tokens", "output_tokens", "usd"}
+    assert set(metadata["agents"]) == set(STEPS)
+    assert metadata["agents"]["generate_image"]["version"] == "gemini-flash-image"
 
 
-def test_main_retries_failed_joke_grading(monkeypatch, log_output):
+def test_main_retries_failed_joke_grading(log_output):
     joke_grades = iter(
         [Grade(passed=False, feedback="* The funny part is not last."), Grade(passed=True)]
     )
@@ -714,8 +755,10 @@ def test_main_retries_failed_joke_grading(monkeypatch, log_output):
     def grade_for(prompt: str) -> Grade:
         return next(joke_grades) if "# Evaluate Joke" in prompt else Grade(passed=True)
 
-    _set_all_step_models(monkeypatch, FunctionModel(_pipeline_model(grade_for), profile=_PROFILE))
-    with _find_topic_agent.override(model=canned_model("A fake topic."), native_tools=[]):
+    with (
+        _override_step_models(FunctionModel(_pipeline_model(grade_for), profile=_PROFILE)),
+        _find_topic_agent.override(model=canned_model("A fake topic."), native_tools=[]),
+    ):
         joke_generator.main()
 
     out = "".join(log_output)
@@ -723,7 +766,7 @@ def test_main_retries_failed_joke_grading(monkeypatch, log_output):
     assert "Joke: A fake joke." in out
 
 
-def test_main_retries_failed_subtext_grading(monkeypatch, log_output):
+def test_main_retries_failed_subtext_grading(log_output):
     subtext_grades = iter(
         [Grade(passed=False, feedback="* Not a simple sentence."), Grade(passed=True)]
     )
@@ -731,8 +774,10 @@ def test_main_retries_failed_subtext_grading(monkeypatch, log_output):
     def grade_for(prompt: str) -> Grade:
         return next(subtext_grades) if "# Evaluate Subtext" in prompt else Grade(passed=True)
 
-    _set_all_step_models(monkeypatch, FunctionModel(_pipeline_model(grade_for), profile=_PROFILE))
-    with _find_topic_agent.override(model=canned_model("A fake topic."), native_tools=[]):
+    with (
+        _override_step_models(FunctionModel(_pipeline_model(grade_for), profile=_PROFILE)),
+        _find_topic_agent.override(model=canned_model("A fake topic."), native_tools=[]),
+    ):
         joke_generator.main()
 
     out = "".join(log_output)
@@ -752,11 +797,28 @@ def test_main_gives_up_after_max_grade_attempts(monkeypatch, log_output, heading
             return Grade(passed=False, feedback="* Still wrong.")
         return Grade(passed=True)
 
-    _set_all_step_models(monkeypatch, FunctionModel(_pipeline_model(grade_for), profile=_PROFILE))
-    with _find_topic_agent.override(model=canned_model("A fake topic."), native_tools=[]):
-        with pytest.raises(RuntimeError, match=f"{step} failed grading after 2 attempts"):
-            joke_generator.main()
+    with (
+        _override_step_models(FunctionModel(_pipeline_model(grade_for), profile=_PROFILE)),
+        _find_topic_agent.override(model=canned_model("A fake topic."), native_tools=[]),
+        pytest.raises(RuntimeError, match=f"{step} failed grading after 2 attempts"),
+    ):
+        joke_generator.main()
 
     out = "".join(log_output)
     assert f"{step} failed grading (attempt 1):\n* Still wrong." in out
     assert f"{step} failed grading (attempt 2):\n* Still wrong." in out
+
+
+def test_main_rejects_an_unknown_version_before_any_model_call(monkeypatch):
+    calls = []
+
+    def model(messages: list, info: AgentInfo) -> ModelResponse:
+        calls.append(info)
+        return ModelResponse(parts=[TextPart(content="A fake topic.")])
+
+    monkeypatch.setattr(settings, "describe_image_agent", "claud-opus")
+    message = "Unknown describe_image agent version 'claud-opus'; available: gemini-flash"
+    with _find_topic_agent.override(model=FunctionModel(model, profile=_PROFILE), native_tools=[]):
+        with pytest.raises(AgentVersionError, match=re.escape(message)):
+            joke_generator.main()
+    assert calls == []

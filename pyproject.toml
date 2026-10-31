@@ -8,7 +8,9 @@ dependencies = [
     "httpx>=0.28.1",
     "loguru>=0.7.3",
     "pillow>=12.3.0",
+    "pydantic>=2.13.4",
     "pydantic-ai>=2.27.0",
+    "pydantic-ai-slim[spec]>=2.27.0",
     "pydantic-settings>=2.15.0",
 ]
 
@@ -25,6 +27,7 @@ dev = [
     "pytest>=9.1.1",
     "pytest-cov>=7.1.0",
     "ruff>=0.16.2",
+    "types-pyyaml>=6.0.12.20261030",
 ]
 
 [tool.mypy]
